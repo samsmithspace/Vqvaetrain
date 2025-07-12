@@ -26,12 +26,17 @@ OBS_RESIZE_CONFIG = {
 # Add these functions to training_helpers.py after the existing functions
 
 def get_optimized_args(args):
-    """Apply GPU utilization optimizations to args"""
+    """Apply GPU utilization optimizations to args with Windows multiprocessing fix"""
+
+    # Windows multiprocessing fix - MUST come first before any other settings
     if platform.system() == 'Windows':
         print("Windows detected - disabling multiprocessing to avoid pickle errors")
-        args.n_preload = 0  # Disable multiprocessing on Windows
+        args.n_preload = 0  # Force disable multiprocessing on Windows
+        # Don't override this setting later
+        windows_multiprocessing_disabled = True
     else:
-        args.n_preload = max(args.n_preload, min(8, os.cpu_count()))
+        windows_multiprocessing_disabled = False
+
     # Data loading optimizations
     if torch.cuda.is_available():
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3  # GB
@@ -47,8 +52,9 @@ def get_optimized_args(args):
             args.batch_size = max(args.batch_size, 6144)
             args.eval_batch_size = max(args.eval_batch_size, 1536)
 
-    # Increase number of data loading workers
-    args.n_preload = max(args.n_preload, min(8, os.cpu_count()))
+    # Only increase workers if NOT on Windows
+    if not windows_multiprocessing_disabled:
+        args.n_preload = max(args.n_preload, min(8, os.cpu_count()))
 
     # Enable data preloading for smaller datasets
     if not hasattr(args, 'preload_data') or not args.preload_data:
@@ -72,7 +78,8 @@ def get_optimized_args(args):
     if not hasattr(args, 'pin_memory'):
         args.pin_memory = torch.cuda.is_available()
     if not hasattr(args, 'persistent_workers'):
-        args.persistent_workers = args.n_preload > 0
+        # Only enable persistent workers if we have workers and not on Windows
+        args.persistent_workers = args.n_preload > 0 and not windows_multiprocessing_disabled
     if not hasattr(args, 'prefetch_factor'):
         args.prefetch_factor = 2
 
@@ -83,6 +90,8 @@ def get_optimized_args(args):
     print(f"  Preload data: {getattr(args, 'preload_data', False)}")
     print(f"  Mixed precision: {getattr(args, 'use_amp', False)}")
     print(f"  Accumulation steps: {getattr(args, 'accumulation_steps', 1)}")
+    if windows_multiprocessing_disabled:
+        print(f"  Windows multiprocessing: DISABLED")
 
     return args
 
@@ -138,6 +147,8 @@ def setup_efficient_model(model, args):
             print(f"torch.compile failed: {e}")
 
     return model
+
+
 def get_obs_target_size(env_name, default_size=(48, 48)):
     """Get target observation size for an environment.
 
@@ -156,12 +167,6 @@ def get_obs_target_size(env_name, default_size=(48, 48)):
     # Cache the result
     OBS_RESIZE_CONFIG['cache_sizes'][env_name] = target_size
     return target_size
-
-
-
-
-
-
 
 
 def fast_obs_resize(obs, target_size=None, mode=None):
@@ -305,7 +310,6 @@ def add_model_args(parser):
     parser.add_argument('--codebook_size', type=int, default=16)
     parser.add_argument('--ae_model_hash', type=str, default=None)
 
-
     parser.add_argument('--trans_hidden', type=int, default=256)
     parser.add_argument('--trans_depth', type=int, default=3)
     parser.add_argument('--stochastic', type=str, default='simple',
@@ -397,7 +401,10 @@ def process_args(args):
     return args
 
 
-
+def freeze_model(model):
+    """Freeze all parameters in a model"""
+    for param in model.parameters():
+        param.requires_grad = False
 
 
 def test_model(model, test_func, data_loader):
@@ -662,5 +669,3 @@ class ObservationResizeWrapper:
     def __getattr__(self, name):
         # Delegate attribute access to the wrapped dataset
         return getattr(self.dataset, name)
-
-

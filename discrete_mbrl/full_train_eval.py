@@ -14,9 +14,6 @@ import torch
 from training_helpers import optimize_gpu_memory, setup_efficient_model
 
 
-
-
-
 # Add optimized training functions
 def train_encoder_optimized(args):
     """Optimized version of train_encoder"""
@@ -63,22 +60,10 @@ def full_train_optimized(args):
     return encoder_model, trans_model
 
 
-# Replace the main() function in your full_train_eval.py with this:
-
 def main():
-    """Run all validation tests with GPU optimizations"""
+    """Run all validation tests with proper Windows support and GPU optimizations"""
     # Parse args first
     args = get_args()
-
-    # Then apply optimizations manually if the functions exist
-    try:
-        from training_helpers import get_optimized_args, optimize_gpu_memory, setup_efficient_model
-        args = get_optimized_args(args)
-        optimize_gpu_memory()
-        print("GPU optimizations applied successfully")
-    except (ImportError, AttributeError) as e:
-        print(f"GPU optimizations not available: {e}")
-        print("Running with standard configuration...")
 
     # Setup logging
     args = init_experiment('discrete-mbrl-full', args)
@@ -87,6 +72,9 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+
+    # Apply GPU memory optimizations
+    optimize_gpu_memory()
 
     if args.e2e_loss:
         # Train and test end-to-end model
