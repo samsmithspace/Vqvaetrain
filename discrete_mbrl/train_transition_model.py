@@ -6,7 +6,12 @@ sys.path.insert(1, os.path.join(sys.path[0], '..'))
 
 import functools
 import torch
-from torch.cuda.amp import autocast, GradScaler
+
+# Fix the autocast import for newer PyTorch versions
+try:
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
 from contextlib import nullcontext
 
 from shared.models import *
@@ -72,7 +77,14 @@ def train_trans_model(args, encoder_model=None):
     # Setup mixed precision training
     use_amp = getattr(args, 'use_amp', False) and args.device == 'cuda'
     scaler = GradScaler() if use_amp else None
-    autocast_context = autocast if use_amp else nullcontext
+    # Fix autocast context for newer PyTorch versions
+    if use_amp:
+        try:
+            autocast_context = lambda: autocast('cuda')
+        except TypeError:
+            autocast_context = autocast
+    else:
+        autocast_context = nullcontext
     accumulation_steps = getattr(args, 'accumulation_steps', 1)
 
     print(f'Using mixed precision: {use_amp}')
@@ -194,7 +206,14 @@ def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=N
 
     # Setup mixed precision training
     scaler = GradScaler() if use_amp else None
-    autocast_context = autocast if use_amp else nullcontext
+    # Fix autocast context for newer PyTorch versions
+    if use_amp:
+        try:
+            autocast_context = lambda: autocast('cuda')
+        except TypeError:
+            autocast_context = autocast
+    else:
+        autocast_context = nullcontext
 
     # Pre-allocate tensors to reduce memory allocation overhead
     device = next(model.parameters()).device
@@ -268,11 +287,44 @@ def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_s
 
     # Forward pass with autocast
     with trainer.autocast_context():
-        loss, aux_data = trainer.calculate_losses(batch_data)
-        if isinstance(loss, dict):
-            # Handle multiple losses
-            total_loss = sum(v for k, v in loss.items() if 'loss' in k.lower()) / accumulation_steps
+        result = trainer.calculate_losses(batch_data)
+
+        # Handle different return types from calculate_losses
+        if isinstance(result, tuple) and len(result) == 2:
+            loss, aux_data = result
         else:
+            loss = result
+            aux_data = {}
+
+        # Validate that loss is numeric
+        if isinstance(loss, str):
+            raise ValueError(f"Loss calculation returned an error: {loss}")
+
+        if isinstance(loss, dict):
+            # Handle different loss dictionary formats
+            if 'loss' in loss:
+                # Standard case: single 'loss' key
+                total_loss = loss['loss']
+            else:
+                # Handle component losses (e.g., VQ-VAE, transition models with multiple losses)
+                total_loss = 0
+                loss_components = []
+                for k, v in loss.items():
+                    if 'loss' in k.lower() and isinstance(v, (torch.Tensor, float, int)):
+                        total_loss += v
+                        loss_components.append(k)
+
+                if total_loss == 0 or len(loss_components) == 0:
+                    raise ValueError(f"No valid loss components found in loss dict. Got keys: {list(loss.keys())}")
+
+                # Add the total loss to the dict for logging
+                loss['loss'] = total_loss
+
+            total_loss = total_loss / accumulation_steps
+        else:
+            # Validate that loss is numeric
+            if not isinstance(loss, (torch.Tensor, float, int)):
+                raise ValueError(f"Loss must be numeric, got {type(loss)}: {loss}")
             total_loss = loss / accumulation_steps
             loss = {'loss': loss}
 
@@ -313,9 +365,34 @@ def test_model_optimized(model, test_func, data_loader, device):
                 else:
                     batch_data = batch_data.to(device, non_blocking=True)
 
-                loss = test_func(batch_data)
+                result = test_func(batch_data)
+
+                # Handle different return types
+                if isinstance(result, tuple) and len(result) == 2:
+                    loss, _ = result
+                else:
+                    loss = result
+
+                # Validate loss
+                if isinstance(loss, str):
+                    print(f"Warning: Test function returned error: {loss}")
+                    continue
+
                 if not isinstance(loss, dict):
-                    loss = {'loss': loss.mean()}
+                    if isinstance(loss, (torch.Tensor, float, int)):
+                        loss = {'loss': loss.mean() if torch.is_tensor(loss) else loss}
+                    else:
+                        print(f"Warning: Invalid loss type {type(loss)}, skipping batch")
+                        continue
+                else:
+                    # Handle component loss dictionaries
+                    if 'loss' not in loss:
+                        # Sum up component losses to create total loss
+                        total_loss = 0
+                        for k, v in loss.items():
+                            if 'loss' in k.lower() and isinstance(v, (torch.Tensor, float, int)):
+                                total_loss += v.mean() if torch.is_tensor(v) else v
+                        loss['loss'] = total_loss
 
                 # Convert to CPU only when needed for storage
                 loss_dict = {}
@@ -325,8 +402,12 @@ def test_model_optimized(model, test_func, data_loader, device):
                             loss_dict[k] = v.item()
                         else:
                             loss_dict[k] = v.mean().item()
-                    else:
+                    elif isinstance(v, (float, int)):
                         loss_dict[k] = v
+                    else:
+                        print(f"Warning: Invalid loss value type {type(v)} for key {k}, skipping")
+                        continue
+
                 losses.append(loss_dict)
 
             except Exception as e:

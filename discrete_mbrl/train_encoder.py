@@ -6,7 +6,12 @@ import time
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 
 import torch
-from torch.cuda.amp import autocast, GradScaler
+
+# Fix the autocast import for newer PyTorch versions
+try:
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
 from contextlib import nullcontext
 
 from shared.models import *
@@ -63,7 +68,14 @@ def train_encoder(args):
     # Setup mixed precision training
     use_amp = getattr(args, 'use_amp', False) and args.device == 'cuda'
     scaler = GradScaler() if use_amp else None
-    autocast_context = autocast if use_amp else nullcontext
+    # Fix autocast context for newer PyTorch versions
+    if use_amp:
+        try:
+            autocast_context = lambda: autocast('cuda')
+        except TypeError:
+            autocast_context = autocast
+    else:
+        autocast_context = nullcontext
     accumulation_steps = getattr(args, 'accumulation_steps', 1)
 
     print(f'Using mixed precision: {use_amp}')
@@ -187,7 +199,14 @@ def optimized_train_loop(model, trainer, train_loader, valid_loader=None, n_epoc
 
     # Setup mixed precision training
     scaler = GradScaler() if use_amp else None
-    autocast_context = autocast if use_amp else nullcontext
+    # Fix autocast context for newer PyTorch versions
+    if use_amp:
+        try:
+            autocast_context = lambda: autocast('cuda')
+        except TypeError:
+            autocast_context = autocast
+    else:
+        autocast_context = nullcontext
 
     # Pre-allocate tensors to reduce memory allocation overhead
     device = next(model.parameters()).device
@@ -261,10 +280,30 @@ def trainer_train_mixed_precision(trainer, batch_data, accumulation_steps):
 
     # Forward pass with autocast
     with trainer.autocast_context():
-        loss, aux_data = trainer.calculate_losses(batch_data)
-        if isinstance(loss, dict):
-            total_loss = loss['loss'] / accumulation_steps
+        result = trainer.calculate_losses(batch_data)
+
+        # Handle different return types from calculate_losses
+        if isinstance(result, tuple) and len(result) == 2:
+            loss, aux_data = result
         else:
+            loss = result
+            aux_data = {}
+
+        # Validate that loss is numeric
+        if isinstance(loss, str):
+            raise ValueError(f"Loss calculation returned an error: {loss}")
+
+        if isinstance(loss, dict):
+            if 'loss' not in loss:
+                raise ValueError(f"Loss dict must contain 'loss' key, got keys: {list(loss.keys())}")
+            total_loss = loss['loss'] / accumulation_steps
+            # Validate that the loss value is numeric
+            if not isinstance(total_loss, (torch.Tensor, float, int)):
+                raise ValueError(f"Loss value must be numeric, got {type(total_loss)}: {total_loss}")
+        else:
+            # Validate that loss is numeric
+            if not isinstance(loss, (torch.Tensor, float, int)):
+                raise ValueError(f"Loss must be numeric, got {type(loss)}: {loss}")
             total_loss = loss / accumulation_steps
             loss = {'loss': loss}
 
@@ -299,12 +338,46 @@ def test_model_optimized(model, test_func, data_loader, device):
             else:
                 batch_data = batch_data.to(device, non_blocking=True)
 
-            loss = test_func(batch_data)
-            if not isinstance(loss, dict):
-                loss = {'loss': loss.mean()}
+            try:
+                result = test_func(batch_data)
 
-            # Convert to CPU only when needed for storage
-            losses.append({k: v.item() if torch.is_tensor(v) else v for k, v in loss.items()})
+                # Handle different return types
+                if isinstance(result, tuple) and len(result) == 2:
+                    loss, _ = result
+                else:
+                    loss = result
+
+                # Validate loss
+                if isinstance(loss, str):
+                    print(f"Warning: Test function returned error: {loss}")
+                    continue
+
+                if not isinstance(loss, dict):
+                    if isinstance(loss, (torch.Tensor, float, int)):
+                        loss = {'loss': loss.mean() if torch.is_tensor(loss) else loss}
+                    else:
+                        print(f"Warning: Invalid loss type {type(loss)}, skipping batch")
+                        continue
+
+                # Convert to CPU only when needed for storage
+                loss_dict = {}
+                for k, v in loss.items():
+                    if torch.is_tensor(v):
+                        if v.numel() == 1:
+                            loss_dict[k] = v.item()
+                        else:
+                            loss_dict[k] = v.mean().item()
+                    elif isinstance(v, (float, int)):
+                        loss_dict[k] = v
+                    else:
+                        print(f"Warning: Invalid loss value type {type(v)} for key {k}, skipping")
+                        continue
+
+                losses.append(loss_dict)
+
+            except Exception as e:
+                print(f"Error in test batch: {e}")
+                continue
 
     return losses
 
