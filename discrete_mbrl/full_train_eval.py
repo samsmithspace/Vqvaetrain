@@ -81,14 +81,26 @@ def main():
         encoder_model, trans_model = full_train(args)
     else:
         # Train and test the encoder model
+        print("🚀 Starting encoder training...")
         encoder_model = train_encoder(args)
+        print(f"✅ Encoder training completed. Model type: {type(encoder_model)}")
+
+        # Ensure we have a proper PyTorch model before continuing
+        if not hasattr(encoder_model, 'parameters'):
+            raise ValueError(f"train_encoder returned invalid object: {type(encoder_model)}")
+
         # Train and test the transition model
+        print("🚀 Starting transition model training...")
         trans_model = train_trans_model(args, encoder_model)
+        print(f"✅ Transition model training completed. Model type: {type(trans_model)}")
+
         # Train and evaluate an RL model with the learned model
         if args.rl_train_steps > 0:
+            print("🚀 Starting RL model training...")
             train_rl_model(args, encoder_model, trans_model)
 
     # Evaluate the models
+    print("🚀 Starting model evaluation...")
     eval_model(args, encoder_model, trans_model)
 
     # Clean up logging

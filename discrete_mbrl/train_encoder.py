@@ -62,8 +62,11 @@ def train_encoder(args):
         sample_obs.shape[1:], args, load=args.load)
     update_params(args)
 
-    # Apply GPU optimizations to model
+    # Apply basic GPU optimizations (without torch.compile)
     model = setup_efficient_model(model, args)
+
+    # Apply torch.compile separately after basic setup
+    training_model = apply_torch_compile(model, args)
 
     # Setup mixed precision training
     use_amp = getattr(args, 'use_amp', False) and args.device == 'cuda'
@@ -80,10 +83,10 @@ def train_encoder(args):
 
     print(f'Using mixed precision: {use_amp}')
     print(f'Gradient accumulation steps: {accumulation_steps}')
-    print('# Params:', sum([x.numel() for x in model.parameters()]))
-    print(model)
+    print('# Params:', sum([x.numel() for x in model.parameters()]))  # Use original model for param count
+    print(training_model)
 
-    track_model(model, args)
+    track_model(model, args)  # Use original model for tracking
 
     if hasattr(model, 'disable_sparsity'):
         model.disable_sparsity()
@@ -91,7 +94,7 @@ def train_encoder(args):
     # Check if training is needed
     if args.epochs <= 0 or trainer is None:
         print('No training required for this model type or epochs=0')
-        return model
+        return model  # Return original model, not compiled one
 
     trainer.recon_loss_clip = args.recon_loss_clip
 
@@ -104,7 +107,7 @@ def train_encoder(args):
     def train_callback(train_data, batch_idx, epoch, **kwargs):
         global ENCODER_STEP, train_log_buffer
         if args.save and epoch % args.checkpoint_freq == 0 and batch_idx == 0:
-            save_model(model, args, model_hash=args.ae_model_hash)
+            save_model(model, args, model_hash=args.ae_model_hash)  # Use original model for saving
 
         for k, v in train_data.items():
             if isinstance(v, torch.Tensor):
@@ -146,7 +149,7 @@ def train_encoder(args):
             args, prefix='encoder', step=ENCODER_STEP)
 
         if batch_idx == 0 and epoch % args.checkpoint_freq == 0:
-            # Generate sample reconstructions less frequently
+            # Generate sample reconstructions less frequently - use original model
             valid_recons = sample_recon_imgs(
                 model, valid_loader, env_name=args.env_name, rev_transform=rev_transform)
             train_recons = sample_recon_imgs(
@@ -157,9 +160,9 @@ def train_encoder(args):
                 args, prefix='encoder', step=ENCODER_STEP)
 
     try:
-        # Use optimized training loop
+        # Use optimized training loop with the compiled model for training
         optimized_train_loop(
-            model, trainer, train_loader, valid_loader, args.epochs,
+            training_model, trainer, train_loader, valid_loader, args.epochs,
             args.batch_size, args.log_freq, callback=train_callback,
             valid_callback=valid_callback, use_amp=use_amp,
             accumulation_steps=accumulation_steps)
@@ -170,7 +173,7 @@ def train_encoder(args):
     global train_log_buffer
     del train_log_buffer
 
-    # Test the model (only if trainer exists)
+    # Test the model (only if trainer exists) - use original model for testing
     if trainer is not None:
         print('Starting model evaluation...')
         test_losses = test_model_optimized(model, trainer.calculate_losses, test_loader, args.device)
@@ -180,10 +183,10 @@ def train_encoder(args):
         print('Skipping model evaluation (no trainer for this model type)')
 
     if args.save:
-        save_model(model, args, model_hash=args.ae_model_hash)
+        save_model(model, args, model_hash=args.ae_model_hash)  # Save original model
         print('Encoder model saved')
 
-    return model
+    return model  # Return the original model, not the compiled one
 
 
 def optimized_train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
@@ -294,9 +297,26 @@ def trainer_train_mixed_precision(trainer, batch_data, accumulation_steps):
             raise ValueError(f"Loss calculation returned an error: {loss}")
 
         if isinstance(loss, dict):
-            if 'loss' not in loss:
-                raise ValueError(f"Loss dict must contain 'loss' key, got keys: {list(loss.keys())}")
-            total_loss = loss['loss'] / accumulation_steps
+            # Handle different loss dictionary formats
+            if 'loss' in loss:
+                # Standard case: single 'loss' key
+                total_loss = loss['loss']
+            else:
+                # Handle component losses (e.g., VQ-VAE, autoencoder models with multiple losses)
+                total_loss = 0
+                loss_components = []
+                for k, v in loss.items():
+                    if 'loss' in k.lower() and isinstance(v, (torch.Tensor, float, int)):
+                        total_loss += v
+                        loss_components.append(k)
+
+                if total_loss == 0 or len(loss_components) == 0:
+                    raise ValueError(f"No valid loss components found in loss dict. Got keys: {list(loss.keys())}")
+
+                # Add the total loss to the dict for logging
+                loss['loss'] = total_loss
+
+            total_loss = total_loss / accumulation_steps
             # Validate that the loss value is numeric
             if not isinstance(total_loss, (torch.Tensor, float, int)):
                 raise ValueError(f"Loss value must be numeric, got {type(total_loss)}: {total_loss}")

@@ -1,3 +1,4 @@
+#trainers.py
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 
@@ -386,7 +387,60 @@ class DiscreteTransitionTrainer():
 
     device = next(self.model.parameters()).device
 
-    initial_obs = batch_data[0][:, 0].to(device)
+    # Debug: Print the original shape
+    print(f"DEBUG: Original batch_data[0] shape: {batch_data[0].shape}")
+
+    # Extract initial observation
+    obs_data = batch_data[0][:, 0]  # Get first timestep
+    print(f"DEBUG: After [:, 0] extraction, shape: {obs_data.shape}")
+
+    # Move to device
+    obs_data = obs_data.to(device)
+
+    # Handle frame stacking - if the data has frame stacking built in
+    # Shape could be [batch, 1, frames, channels, height, width] or similar
+    if len(obs_data.shape) == 6:  # [batch, 1, frames, channels, height, width]
+      if obs_data.shape[1] == 1:
+        obs_data = obs_data.squeeze(1)  # Remove dimension of size 1
+        print(f"DEBUG: After squeeze(1), shape: {obs_data.shape}")
+
+      # Now should be [batch, frames, channels, height, width]
+      if len(obs_data.shape) == 5:
+        # If frames are stacked, we might want all frames as channels
+        # or just the last/first frame
+        batch, frames, channels, height, width = obs_data.shape
+
+        # Option 1: Use only the last frame (most recent)
+        initial_obs = obs_data[:, -1]  # [batch, channels, height, width]
+
+        # Option 2: Concatenate frames as channels (uncomment if needed)
+        # initial_obs = obs_data.reshape(batch, frames * channels, height, width)
+
+        print(f"DEBUG: Final initial_obs shape: {initial_obs.shape}")
+    elif len(obs_data.shape) == 5:  # [batch, frames, channels, height, width]
+      # Take the last frame
+      initial_obs = obs_data[:, -1]
+    elif len(obs_data.shape) == 4:  # Already correct shape
+      initial_obs = obs_data
+    else:
+      # Try to reshape/squeeze to get to 4D
+      original_shape = obs_data.shape
+      obs_data_flat = obs_data.reshape(obs_data.shape[0], -1)
+
+      # Try to infer image dimensions
+      total_pixels = obs_data_flat.shape[1]
+      # Common image sizes
+      for h, w in [(48, 48), (64, 64), (84, 84), (96, 96), (128, 128)]:
+        for c in [1, 3, 4]:  # grayscale, RGB, or RGBA
+          if h * w * c == total_pixels:
+            initial_obs = obs_data_flat.reshape(obs_data.shape[0], c, h, w)
+            print(f"DEBUG: Reshaped from {original_shape} to {initial_obs.shape}")
+            break
+        else:
+          continue
+        break
+      else:
+        raise ValueError(f"Cannot reshape observation with shape {original_shape} to 4D tensor")
 
     encodings = self.encoder.encode(initial_obs)
     if not self.incl_encoder:
@@ -395,51 +449,63 @@ class DiscreteTransitionTrainer():
     losses = OrderedDict()
     batch_size = initial_obs.shape[0]
     loss_mask = torch.ones(batch_size, device=device, requires_grad=False)
+
     for i in range(n):
       acts = batch_data[1][:, i].to(device)
-      next_obs = batch_data[2][:, i].to(device)
+      next_obs_data = batch_data[2][:, i].to(device)
       rewards = batch_data[3][:, i].to(device)
       dones = batch_data[4][:, i].to(device)
       gammas = (1 - dones.float()) * self.default_gamma
 
+      # Process next_obs the same way
+      if len(next_obs_data.shape) == 6 and next_obs_data.shape[1] == 1:
+        next_obs_data = next_obs_data.squeeze(1)
+
+      if len(next_obs_data.shape) == 5:
+        next_obs = next_obs_data[:, -1]  # Take last frame
+      elif len(next_obs_data.shape) == 4:
+        next_obs = next_obs_data
+      else:
+        # Apply same reshaping logic as above
+        raise ValueError(f"Unexpected next observation shape: {next_obs_data.shape}")
+
       with torch.no_grad():
         next_encodings = self.encoder.encode(next_obs)
-        
+
       oh_outcomes = None
       if self.model.stochastic == 'categorical':
         oh_outcomes, outcome_logits = self.model.discretize(next_encodings, return_logits=True)
-        # TODO: Update this if I ever need to add more variable types to the replay buffer
         if len(batch_data) > 5:
           target_outcomes = batch_data[5][:, i].long().to(device)
           state_disc_loss = F.cross_entropy(outcome_logits, target_outcomes, reduction='none')
-          losses[f'{i+1}_step_state_disc_loss'] = state_disc_loss.masked_select(
+          losses[f'{i + 1}_step_state_disc_loss'] = state_disc_loss.masked_select(
             loss_mask.bool()).mean()
           oh_outcomes = oh_outcomes.detach()
-        
+
       next_logits_pred, reward_preds, gamma_preds, stoch_logits = self.model(
         encodings, acts, oh_outcomes=oh_outcomes, return_logits=True, return_stoch_logits=True)
 
       if self.model.stochastic == 'categorical':
         stoch_probs = F.softmax(stoch_logits, dim=1)
         outcome_losses = one_hot_cross_entropy(stoch_probs, oh_outcomes.detach())
-        losses[f'{i+1}_step_outcome_loss'] = outcome_losses.masked_select(loss_mask[:, None].bool()).mean()
+        losses[f'{i + 1}_step_outcome_loss'] = outcome_losses.masked_select(loss_mask[:, None].bool()).mean()
 
       ### State Loss ##
       state_loss = F.cross_entropy(
         next_logits_pred, next_encodings, reduction='none')
       state_loss = state_loss.view(state_loss.shape[0], -1).sum(dim=1)
       state_loss = state_loss.masked_select(loss_mask.bool())
-      losses[f'{i+1}_step_state_loss'] = state_loss.mean()
+      losses[f'{i + 1}_step_state_loss'] = state_loss.mean()
 
       ### Reward Loss ###
       reward_loss = F.mse_loss(reward_preds.squeeze(), rewards, reduction='none')
       reward_loss = reward_loss.masked_select(loss_mask.bool())
-      losses[f'{i+1}_step_reward_loss'] = reward_loss.mean()
+      losses[f'{i + 1}_step_reward_loss'] = reward_loss.mean()
 
       ### Gamma Loss ###
       gamma_loss = F.mse_loss(gamma_preds.squeeze(), gammas, reduction='none')
       gamma_loss = gamma_loss.masked_select(loss_mask.bool())
-      losses[f'{i+1}_step_gamma_loss'] = gamma_loss.mean()
+      losses[f'{i + 1}_step_gamma_loss'] = gamma_loss.mean()
 
       with torch.no_grad():
         mask_changes = dones.float().nonzero().squeeze()
@@ -685,7 +751,20 @@ class ContinuousTransitionTrainer():
 
     initial_obs = batch_data[0][:, 0].to(device)
 
+    # Handle n-step sequences: extract first timestep if needed
+    if len(batch_data[0].shape) == 5:  # [batch, time_steps, channels, height, width]
+      initial_obs = batch_data[0][:, 0]  # Take first timestep: [batch, channels, height, width]
+      target_obs = batch_data[2][:, 0] if len(batch_data) > 2 else None  # next_obs first timestep
+    else:
+      initial_obs = batch_data[0]  # Already correct shape: [batch, channels, height, width]
+      target_obs = batch_data[2] if len(batch_data) > 2 else None
+
+    # Now encode with correct 4D tensor
     encodings = self.encoder.encode(initial_obs)
+
+    # If target_obs exists, encode it too
+    if target_obs is not None:
+      target_encodings = self.encoder.encode(target_obs)
     if not self.e2e_loss:
       encodings = encodings.detach()
 

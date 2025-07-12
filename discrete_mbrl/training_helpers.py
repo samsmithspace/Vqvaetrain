@@ -138,16 +138,22 @@ def setup_efficient_model(model, args):
     except:
         pass  # Some models don't support channels_last
 
-    # Compile model if using PyTorch 2.0+
-    if hasattr(torch, 'compile') and args.device == 'cuda' and getattr(args, 'compile_model', True):
-        try:
-            model = torch.compile(model, mode='default')  # Use 'default' for stability
-            print("Model compiled with torch.compile")
-        except Exception as e:
-            print(f"torch.compile failed: {e}")
-
+    # Note: torch.compile is applied later in train_encoder, not here
+    # This avoids issues with model attributes being lost
     return model
 
+def apply_torch_compile(model, args):
+    """Apply torch.compile separately after model setup"""
+    # Only compile if using PyTorch 2.0+ and CUDA
+    if hasattr(torch, 'compile') and args.device == 'cuda' and getattr(args, 'compile_model', True):
+        try:
+            compiled_model = torch.compile(model, mode='default')
+            print("Model compiled with torch.compile")
+            return compiled_model
+        except Exception as e:
+            print(f"torch.compile failed: {e}")
+            return model
+    return model
 
 def get_obs_target_size(env_name, default_size=(48, 48)):
     """Get target observation size for an environment.
