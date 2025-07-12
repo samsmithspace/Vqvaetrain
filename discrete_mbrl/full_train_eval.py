@@ -1,0 +1,111 @@
+import os
+import sys
+sys.path.insert(1, os.path.join(sys.path[0], '..'))
+
+from data_logging import init_experiment, finish_experiment
+from env_helpers import *
+from training_helpers import *
+from train_encoder import train_encoder
+from train_transition_model import train_trans_model
+from evaluate_model import eval_model
+from train_rl_model import train_rl_model
+from e2e_train import full_train
+import torch
+from training_helpers import optimize_gpu_memory, setup_efficient_model
+
+
+
+
+
+# Add optimized training functions
+def train_encoder_optimized(args):
+    """Optimized version of train_encoder"""
+    from train_encoder import train_encoder
+
+    print("Starting optimized encoder training...")
+    encoder_model = train_encoder(args)
+
+    # Apply model optimizations
+    encoder_model = setup_efficient_model(encoder_model, args)
+
+    return encoder_model
+
+
+def train_trans_model_optimized(args, encoder_model=None):
+    """Optimized version of train_trans_model"""
+    from train_transition_model import train_trans_model
+
+    print("Starting optimized transition model training...")
+
+    # Optimize encoder model if provided
+    if encoder_model is not None:
+        encoder_model = setup_efficient_model(encoder_model, args)
+
+    trans_model = train_trans_model(args, encoder_model)
+
+    # Apply model optimizations
+    trans_model = setup_efficient_model(trans_model, args)
+
+    return trans_model
+
+
+def full_train_optimized(args):
+    """Optimized version of full_train"""
+    from e2e_train import full_train
+
+    print("Starting optimized end-to-end training...")
+    encoder_model, trans_model = full_train(args)
+
+    # Apply model optimizations
+    encoder_model = setup_efficient_model(encoder_model, args)
+    trans_model = setup_efficient_model(trans_model, args)
+
+    return encoder_model, trans_model
+
+
+# Replace the main() function in your full_train_eval.py with this:
+
+def main():
+    """Run all validation tests with GPU optimizations"""
+    # Parse args first
+    args = get_args()
+
+    # Then apply optimizations manually if the functions exist
+    try:
+        from training_helpers import get_optimized_args, optimize_gpu_memory, setup_efficient_model
+        args = get_optimized_args(args)
+        optimize_gpu_memory()
+        print("GPU optimizations applied successfully")
+    except (ImportError, AttributeError) as e:
+        print(f"GPU optimizations not available: {e}")
+        print("Running with standard configuration...")
+
+    # Setup logging
+    args = init_experiment('discrete-mbrl-full', args)
+
+    print(f"Using device: {args.device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+
+    if args.e2e_loss:
+        # Train and test end-to-end model
+        encoder_model, trans_model = full_train(args)
+    else:
+        # Train and test the encoder model
+        encoder_model = train_encoder(args)
+        # Train and test the transition model
+        trans_model = train_trans_model(args, encoder_model)
+        # Train and evaluate an RL model with the learned model
+        if args.rl_train_steps > 0:
+            train_rl_model(args, encoder_model, trans_model)
+
+    # Evaluate the models
+    eval_model(args, encoder_model, trans_model)
+
+    # Clean up logging
+    finish_experiment(args)
+
+
+if __name__ == '__main__':
+    main()
