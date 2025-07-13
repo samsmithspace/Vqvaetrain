@@ -713,8 +713,14 @@ def _evaluate_single_step(step, obs, acts, next_obs, rewards, dones, gammas, z,
     if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
         next_z = next_z.reshape(next_z.shape[0], encoder_model.latent_dim)
 
+    # FIX: Add .unsqueeze(-1) to make actions 2D for discrete transition models
+    action_tensor = acts[:, step].to(args.device)
+    if args.trans_model_type in DISCRETE_TRANS_TYPES:
+        action_tensor = action_tensor.unsqueeze(-1)
+
     next_z_pred_logits, next_reward_pred, next_gamma_pred = \
-        trans_model(z, acts[:, step].to(args.device), return_logits=True)
+        trans_model(z, action_tensor, return_logits=True)
+
     next_z_pred = trans_model.logits_to_state(next_z_pred_logits)
     if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
         next_z_pred_logits = next_z_pred_logits.reshape(
@@ -726,7 +732,6 @@ def _evaluate_single_step(step, obs, acts, next_obs, rewards, dones, gammas, z,
         encoder_model, init_obs=obs[:, 0], all_obs=unique_obs, all_trans=trans_dict,
         curr_z=z, acts=acts[:, step], env_name=args.env_name)
     update_losses(n_step_stats, loss_dict, args, step + 1)
-
 
 def _log_transition_stats(n_step_stats, args):
     """Log aggregated transition model statistics."""
@@ -851,7 +856,11 @@ def _create_normal_encoder_visualizations(all_obs, acts, dones, encoder_model, t
     continue_mask = torch.ones(all_obs.shape[0])
     for step in range(min(args.eval_unroll_steps, all_obs.shape[1] - 1, acts.shape[1])):
         # Predict next state
-        z = trans_model(z, acts[:, step].to(args.device))[0]
+        # Fix: Add .unsqueeze(-1) to make actions 2D for discrete transition models
+        action_tensor = acts[:, step].to(args.device)
+        if args.trans_model_type in DISCRETE_TRANS_TYPES:
+            action_tensor = action_tensor.unsqueeze(-1)
+        z = trans_model(z, action_tensor)[0]
         pred_obs = encoder_model.decode(z).cpu()
 
         # Resize prediction if needed
