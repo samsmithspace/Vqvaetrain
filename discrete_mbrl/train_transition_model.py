@@ -44,61 +44,58 @@ def get_autocast_context(device, use_amp=True):
         return nullcontext()
 
 
-def fix_batch_data_shapes(batch_data):
-    """Fix tensor shapes for multi-step training data"""
+def debug_tensor_shapes(batch_data, step_name=""):
+    """Debug function to print tensor shapes - disabled for production"""
+    pass
+
+
+def fix_batch_data_shapes(batch_data, n_train_unroll=1):
+    """
+    Fix tensor shapes for multi-step training data with proper validation
+    """
     if not batch_data or not torch.is_tensor(batch_data[0]):
         return batch_data
 
     obs = batch_data[0]
 
-    # Debug print - uncomment to debug
-    # print(f"Original batch data shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in batch_data]}")
-
-    # Check if we have the unroll dimension [batch, n_steps, ...]
+    # Validate the expected input format
     if len(obs.shape) == 5:  # [batch, n_steps, channels, height, width]
+        batch_size, n_steps = obs.shape[:2]
+
+        # Verify n_steps matches expected
+        if n_steps != n_train_unroll:
+            print(f"Warning: Data has {n_steps} steps but expected {n_train_unroll}")
+
         fixed_data = []
         for i, x in enumerate(batch_data):
             if torch.is_tensor(x):
-                if i in [0, 2] and len(x.shape) == 5:  # Observations
+                if i in [0, 2] and len(x.shape) == 5:  # Observations (obs, next_obs)
                     # Reshape from [batch, n_steps, C, H, W] to [batch * n_steps, C, H, W]
-                    batch_size, n_steps = x.shape[:2]
                     new_shape = [batch_size * n_steps] + list(x.shape[2:])
-                    fixed_data.append(x.reshape(new_shape))
-                elif len(x.shape) == 2:  # Actions or rewards [batch, n_steps]
+                    reshaped = x.reshape(new_shape)
+                    fixed_data.append(reshaped)
+                elif len(x.shape) == 2:  # Actions, rewards, dones [batch, n_steps]
                     # Flatten to [batch * n_steps]
-                    fixed_data.append(x.reshape(-1))
+                    reshaped = x.reshape(-1)
+                    fixed_data.append(reshaped)
                 elif len(x.shape) == 3 and i in [1, 3, 4]:  # Could be [batch, n_steps, action_dim]
-                    # Flatten to [batch * n_steps, action_dim] or [batch * n_steps]
                     batch_size, n_steps = x.shape[:2]
                     if x.shape[2] == 1:
-                        fixed_data.append(x.reshape(-1))
+                        reshaped = x.reshape(-1)
                     else:
-                        fixed_data.append(x.reshape(batch_size * n_steps, -1))
+                        reshaped = x.reshape(batch_size * n_steps, -1)
+                    fixed_data.append(reshaped)
                 else:
                     fixed_data.append(x)
             else:
                 fixed_data.append(x)
+
         return fixed_data
 
-    # Check for incorrect tensor shapes where batch dim is in wrong place
-    elif len(obs.shape) == 4:
-        # Standard case - check if already in correct format
-        if obs.shape[1] == 3:  # RGB channels
-            return batch_data
-
-        # Check if first dimension is 1 and second dimension is too large for channels
-        if obs.shape[0] == 1 and obs.shape[1] > 3:
-            # This is the problematic case from your error
-            print(f"ERROR: Malformed observation tensor with shape {obs.shape}")
-            print(f"This appears to be a data loading issue. The observation should be [batch, 3, H, W]")
-            # Try to continue with a warning rather than crashing
-            # Skip this batch by returning None
-            return None
-
+    elif len(obs.shape) == 4:  # [batch, channels, height, width] - already processed
         return batch_data
 
-    # Check if batch dimension is missing (single sample)
-    elif len(obs.shape) == 3:  # [channels, height, width]
+    elif len(obs.shape) == 3:  # [channels, height, width] - single sample
         # Add batch dimension
         fixed_data = []
         for x in batch_data:
@@ -108,35 +105,106 @@ def fix_batch_data_shapes(batch_data):
                 fixed_data.append(x)
         return fixed_data
 
-    return batch_data
+    else:
+        print(f"Unexpected observation shape: {obs.shape}")
+        return batch_data
 
 
-def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_steps):
+def safe_n_step_calculate_losses(trainer, batch_data, n_train_unroll):
     """
-    Handle training step with proper error handling
+    Safely calculate losses for n-step training with proper tensor handling
+    """
+    # Extract data
+    obs, actions, next_obs, rewards, dones = batch_data[:5]
+    extra_data = batch_data[5:] if len(batch_data) > 5 else []
+
+    if n_train_unroll > 1:
+        # For n-step training, we need to reshape the flattened data back to sequences
+        total_samples = obs.shape[0]
+        batch_size = total_samples // n_train_unroll
+
+        if total_samples % n_train_unroll != 0:
+            print(f"Warning: total_samples ({total_samples}) not divisible by n_train_unroll ({n_train_unroll})")
+            # Adjust to make it divisible
+            new_total = (total_samples // n_train_unroll) * n_train_unroll
+            obs = obs[:new_total]
+            actions = actions[:new_total]
+            next_obs = next_obs[:new_total]
+            rewards = rewards[:new_total]
+            dones = dones[:new_total]
+            extra_data = [x[:new_total] for x in extra_data]
+            batch_size = new_total // n_train_unroll
+
+        # Reshape to [batch_size, n_steps, ...]
+        obs = obs.reshape(batch_size, n_train_unroll, *obs.shape[1:])
+        actions = actions.reshape(batch_size, n_train_unroll,
+                                  *actions.shape[1:]) if actions.dim() > 1 else actions.reshape(batch_size,
+                                                                                                n_train_unroll)
+        next_obs = next_obs.reshape(batch_size, n_train_unroll, *next_obs.shape[1:])
+        rewards = rewards.reshape(batch_size, n_train_unroll,
+                                  *rewards.shape[1:]) if rewards.dim() > 1 else rewards.reshape(batch_size,
+                                                                                                n_train_unroll)
+        dones = dones.reshape(batch_size, n_train_unroll, *dones.shape[1:]) if dones.dim() > 1 else dones.reshape(
+            batch_size, n_train_unroll)
+
+        # Reconstruct batch_data with proper shapes
+        reshaped_batch_data = [obs, actions, next_obs, rewards, dones]
+        for x in extra_data:
+            if x.dim() > 1:
+                reshaped_x = x.reshape(batch_size, n_train_unroll, *x.shape[1:])
+            else:
+                reshaped_x = x.reshape(batch_size, n_train_unroll)
+            reshaped_batch_data.append(reshaped_x)
+
+        batch_data = reshaped_batch_data
+
+    # Now call the original calculate_losses with the properly shaped data
+    try:
+        return trainer.calculate_losses(batch_data, n=n_train_unroll)
+    except Exception as e:
+        print(f"Error in calculate_losses: {e}")
+        print(f"Final batch_data shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in batch_data]}")
+        raise
+
+
+def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_steps, n_train_unroll=1):
+    """
+    Handle training step with proper error handling and n-step support
     """
     try:
-        # Calculate losses
-        result = trainer.calculate_losses(batch_data)
+        # Use the safe n-step calculation
+        result = safe_n_step_calculate_losses(trainer, batch_data, n_train_unroll)
 
         # Handle different return types
         if isinstance(result, dict):
+            #print(f"Result dict keys: {list(result.keys())}")
+
             # Find the main loss tensor
             loss_tensor = None
-            for key in ['loss', 'total_loss', 'combined_loss']:
+            for key in ['loss', 'total_loss', 'combined_loss', 'state_loss', 'trans_loss']:
                 if key in result and torch.is_tensor(result[key]):
                     loss_tensor = result[key]
                     break
 
             if loss_tensor is None:
-                # Sum all tensor values as fallback
-                tensor_losses = [v for v in result.values() if torch.is_tensor(v)]
+                # Sum all tensor values that have 'loss' in their key name
+                tensor_losses = [v for k, v in result.items() if torch.is_tensor(v) and 'loss' in str(k).lower()]
+                if not tensor_losses:
+                    # If no losses found, sum ALL tensor values
+                    tensor_losses = [v for v in result.values() if torch.is_tensor(v)]
+
                 if tensor_losses:
                     loss_tensor = sum(tensor_losses)
+                    #print(
+                    #    f"Created combined loss from {len(tensor_losses)} components: {[k for k, v in result.items() if torch.is_tensor(v) and 'loss' in str(k).lower()]}")
                 else:
-                    raise ValueError("No tensor losses found in result dict")
+                    raise ValueError(f"No tensor losses found in result dict with keys: {list(result.keys())}")
 
-            train_loss = result
+            # Ensure the result dict has a 'loss' key for consistency
+            train_loss = result.copy()
+            if 'loss' not in train_loss:
+                train_loss['loss'] = loss_tensor
+
             aux_data = {}
         elif isinstance(result, tuple) and len(result) == 2:
             loss_tensor, aux_data = result
@@ -150,7 +218,7 @@ def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_s
         if loss_tensor.dim() > 0:
             loss_tensor = loss_tensor.mean()
 
-            # Scale for gradient accumulation
+        # Scale for gradient accumulation
         scaled_loss = loss_tensor / accumulation_steps
 
         return train_loss, aux_data, scaled_loss
@@ -164,9 +232,9 @@ def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_s
 def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
                                     batch_size=128, log_freq=100, seed=0, callback=None,
                                     valid_callback=None, test_func=None, use_amp=True,
-                                    accumulation_steps=1):
+                                    accumulation_steps=1, n_train_unroll=1):
     """
-    Fixed training loop with proper autocast handling
+    Fixed training loop with proper n-step handling
     """
     torch.manual_seed(seed)
     model.train()
@@ -187,15 +255,6 @@ def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=N
 
     print(f"Training on device: {device}, AMP enabled: {use_amp}")
 
-    # Validate data format with first batch
-    try:
-        first_batch = next(iter(train_loader))
-        print(f"First batch shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in first_batch]}")
-        # Move back to CPU to not affect training
-        del first_batch
-    except Exception as e:
-        print(f"Warning: Could not inspect first batch: {e}")
-
     for epoch in range(n_epochs):
         print(f'Starting epoch #{epoch}')
         accumulated_loss = 0.0
@@ -208,7 +267,7 @@ def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=N
                               for x in batch_data]
 
                 # Fix tensor shapes for multi-step training
-                batch_data = fix_batch_data_shapes(batch_data)
+                batch_data = fix_batch_data_shapes(batch_data, n_train_unroll)
 
                 # Skip if batch data is None (malformed data)
                 if batch_data is None:
@@ -220,7 +279,7 @@ def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=N
 
                 with autocast_context:
                     train_loss, aux_data, scaled_loss = transition_trainer_train_mixed_precision(
-                        trainer, batch_data, accumulation_steps)
+                        trainer, batch_data, accumulation_steps, n_train_unroll)
 
                 # Backward pass
                 if scaler is not None:
@@ -257,8 +316,10 @@ def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=N
                         if valid_loader is not None and i % (log_freq * 3) == 0:
                             model.eval()
                             with torch.no_grad():
-                                test_func_to_use = test_func or trainer.calculate_losses
-                                valid_losses = test_model_with_unroll_fix(model, test_func_to_use, valid_loader, device)
+                                test_func_to_use = test_func or (
+                                    lambda bd: safe_n_step_calculate_losses(trainer, bd, n_train_unroll))
+                                valid_losses = test_model_with_unroll_fix(model, test_func_to_use, valid_loader, device,
+                                                                          n_train_unroll)
                                 if valid_losses:  # Check if we got valid results
                                     valid_loss_means = {k: np.mean([x[k] for x in valid_losses])
                                                         for k in valid_losses[0].keys()}
@@ -277,7 +338,7 @@ def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=N
                 continue
 
 
-def test_model_with_unroll_fix(model, test_func, data_loader, device):
+def test_model_with_unroll_fix(model, test_func, data_loader, device, n_train_unroll=1):
     """Test model with proper shape handling"""
     model.eval()
     losses = []
@@ -290,7 +351,7 @@ def test_model_with_unroll_fix(model, test_func, data_loader, device):
                               for x in batch_data]
 
                 # Fix shapes
-                batch_data = fix_batch_data_shapes(batch_data)
+                batch_data = fix_batch_data_shapes(batch_data, n_train_unroll)
 
                 # Skip malformed batches
                 if batch_data is None:
@@ -354,15 +415,6 @@ def train_trans_model(args, encoder_model=None):
 
     trans_model = trans_model.to(args.device)
 
-    # Wrap functions for n-step training
-    original_calculate_losses = trans_trainer.calculate_losses
-
-    def n_step_calculate_losses(batch_data):
-        return original_calculate_losses(batch_data, n=args.n_train_unroll)
-
-    test_func = n_step_calculate_losses
-    trans_trainer.calculate_losses = n_step_calculate_losses
-
     update_params(args)
     track_model(trans_model, args)
 
@@ -416,8 +468,8 @@ def train_trans_model(args, encoder_model=None):
         optimized_transition_train_loop(
             trans_model, trans_trainer, train_loader, valid_loader, n_epochs,
             args.batch_size, args.log_freq, callback=train_callback,
-            valid_callback=valid_callback, test_func=test_func, use_amp=use_amp,
-            accumulation_steps=accumulation_steps)
+            valid_callback=valid_callback, test_func=None, use_amp=use_amp,
+            accumulation_steps=accumulation_steps, n_train_unroll=args.n_train_unroll)
     except KeyboardInterrupt:
         print('Stopping training')
     except Exception as e:
@@ -428,7 +480,8 @@ def train_trans_model(args, encoder_model=None):
     # Test the model
     print('Starting model evaluation...')
     try:
-        test_losses = test_model_with_unroll_fix(trans_model, test_func, test_loader, args.device)
+        test_func = lambda bd: safe_n_step_calculate_losses(trans_trainer, bd, args.n_train_unroll)
+        test_losses = test_model_with_unroll_fix(trans_model, test_func, test_loader, args.device, args.n_train_unroll)
         if test_losses:
             test_losses = {k: np.mean([d[k] for d in test_losses]) for k in test_losses[0].keys()}
             print(f'Transition model test losses: {test_losses}')
@@ -444,88 +497,6 @@ def train_trans_model(args, encoder_model=None):
     return trans_model
 
 
-def test_model_optimized(model, test_func, data_loader, device):
-    """Optimized model testing with batched processing for transition models"""
-    model.eval()
-    losses = []
-
-    with torch.no_grad():
-        for batch_data in data_loader:
-            try:
-                # Efficient data transfer
-                if isinstance(batch_data, (list, tuple)):
-                    batch_data = [x.to(device, non_blocking=True) if torch.is_tensor(x) else x
-                                  for x in batch_data]
-                else:
-                    batch_data = batch_data.to(device, non_blocking=True)
-
-                result = test_func(batch_data)
-
-                # Handle different return types
-                if isinstance(result, tuple) and len(result) == 2:
-                    loss, _ = result
-                else:
-                    loss = result
-
-                # Validate loss
-                if isinstance(loss, str):
-                    print(f"Warning: Test function returned error: {loss}")
-                    continue
-
-                if not isinstance(loss, dict):
-                    if isinstance(loss, (torch.Tensor, float, int)):
-                        loss = {'loss': loss.mean() if torch.is_tensor(loss) else loss}
-                    else:
-                        print(f"Warning: Invalid loss type {type(loss)}, skipping batch")
-                        continue
-                else:
-                    # Handle component loss dictionaries
-                    if 'loss' not in loss:
-                        # Sum up component losses to create total loss
-                        total_loss = 0
-                        for k, v in loss.items():
-                            if 'loss' in k.lower() and isinstance(v, (torch.Tensor, float, int)):
-                                total_loss += v.mean() if torch.is_tensor(v) else v
-                        loss['loss'] = total_loss
-
-                # Convert to CPU only when needed for storage
-                loss_dict = {}
-                for k, v in loss.items():
-                    if torch.is_tensor(v):
-                        if v.numel() == 1:
-                            loss_dict[k] = v.item()
-                        else:
-                            loss_dict[k] = v.mean().item()
-                    elif isinstance(v, (float, int)):
-                        loss_dict[k] = v
-                    else:
-                        print(f"Warning: Invalid loss value type {type(v)} for key {k}, skipping")
-                        continue
-
-                losses.append(loss_dict)
-
-            except Exception as e:
-                print(f"Error in test batch: {e}")
-                continue
-
-    return losses
-
-
-# Additional utility functions for monitoring
-def monitor_gpu_utilization():
-    """Monitor GPU utilization during training"""
-    try:
-        import subprocess
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total',
-                                 '--format=csv,noheader,nounits'], capture_output=True, text=True)
-        if result.returncode == 0:
-            gpu_util, mem_used, mem_total = result.stdout.strip().split(', ')
-            print(
-                f"GPU Util: {gpu_util}% | Memory: {mem_used}/{mem_total} MB ({100 * int(mem_used) / int(mem_total):.1f}%)")
-    except:
-        pass
-
-
 if __name__ == '__main__':
     # Parse args with optimizations
     args = get_args(apply_optimizations=True)
@@ -537,5 +508,3 @@ if __name__ == '__main__':
     if args.save:
         save_model(trans_model, args, model_hash=args.trans_model_hash)
         print('Model saved')
-
-
