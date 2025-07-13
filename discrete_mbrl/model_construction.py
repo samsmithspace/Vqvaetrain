@@ -6,12 +6,13 @@ sys.path.insert(1, os.path.join(sys.path[0], '..'))
 import hashlib
 import json
 from torch import nn
-
+from debug_vqvae_trainer import DebugVQVAETrainer
 from training_helpers import log_param_updates
 from shared.models import *
 from shared.trainers import *
 from shared.models.iris_models import \
   Encoder as IrisEncoder, Decoder as IrisDecoder, EncoderDecoderConfig
+from shared.models.stable_vqvae import StableVQVAEModel, RobustVQVAETrainer
 
 
 DISCRETE_ENCODER_TYPES = set(['vqvae', 'dae', 'softmax_ae', 'hard_fta_ae'])
@@ -322,7 +323,7 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
       print(f'Constructed Soft VQVAE with {model.n_latent_embeds} ' + \
           f'latents and {args.codebook_size} codebook entries')
       trainer = VQVAETrainer(model, lr=args.learning_rate, log_freq=-1, grad_clip=args.ae_grad_clip)
-    
+
     if load:
       load_model(
         model, args, exp_type='encoder', model_vars=AE_MODEL_VARS,
@@ -332,7 +333,7 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
     TrainerClass = VQVAETrainer if args.ae_model_type \
       in ('vqvae', 'soft_vqvae') else AETrainer
     n_latents = args.latent_dim if encoder_type == 'dense' else None
-
+    '''
     if args.ae_model_type == 'vqvae':
       model = VQVAEModel(
         input_dim, codebook_size=args.codebook_size, embedding_dim=args.embedding_dim,
@@ -340,7 +341,40 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
       args_update(args, 'final_latent_dim', model.n_latent_embeds * args.codebook_size)
       print(f'Constructed VQVAE with {model.n_latent_embeds} ' + \
           f'latents and {args.codebook_size} codebook entries')
+    '''
+    if args.ae_model_type == 'vqvae':
+      # REPLACE THE EXISTING VQVAE CONSTRUCTION WITH THIS:
+      print("🔧 Using Stable VQ-VAE implementation")
 
+      # Create encoder and decoder
+      encoder, decoder = make_ae(
+        input_dim, args.embedding_dim, args.filter_size, version=args.ae_model_version)
+
+      # Use stable VQ-VAE model
+      model = StableVQVAEModel(
+        input_dim=input_dim,
+        codebook_size=args.codebook_size,
+        embedding_dim=args.embedding_dim,
+        encoder=encoder,
+        decoder=decoder,
+        commitment_cost=0.25  # Conservative commitment cost
+      )
+
+      args_update(args, 'final_latent_dim', model.n_latent_embeds * args.codebook_size)
+      print(f'Constructed Stable VQVAE with {model.n_latent_embeds} ' + \
+            f'latents and {args.codebook_size} codebook entries')
+
+      if load:
+        load_model(model, args, exp_type='encoder', model_vars=AE_MODEL_VARS,
+                   model_hash=args.ae_model_hash)
+
+      # Use robust trainer
+      trainer = RobustVQVAETrainer(
+        model,
+        lr=args.learning_rate,
+        grad_clip=max(args.ae_grad_clip, 1.0),  # Minimum grad clip of 1.0
+        log_freq=-1
+      )
     elif args.ae_model_type == 'dae':
       model = DAEModel(input_dim, encoder=encoder, decoder=decoder)
       args_update(args, 'final_latent_dim', np.prod(model.encoder_out_shape))

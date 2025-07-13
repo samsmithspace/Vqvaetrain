@@ -540,6 +540,8 @@ def evaluate_random_latent_sampling(encoder_model, all_latents, args, unique_obs
     if is_identity_encoder:
         print('Identity encoder detected - skipping random latent sampling (not applicable)')
         return
+    print("......................")
+    print(args.trans_model_type)
 
     if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
         _evaluate_continuous_latent_sampling(encoder_model, all_latents, args, unique_obs, rev_transform)
@@ -549,6 +551,7 @@ def evaluate_random_latent_sampling(encoder_model, all_latents, args, unique_obs
 
 def _evaluate_continuous_latent_sampling(encoder_model, all_latents, args, unique_obs, rev_transform):
     """Evaluate continuous latent space by sampling."""
+    print("evaluating continuous latent sampling...====================")
     latent_dim = encoder_model.latent_dim
     all_latents = all_latents.reshape(all_latents.shape[0], latent_dim)
 
@@ -575,6 +578,7 @@ def _evaluate_continuous_latent_sampling(encoder_model, all_latents, args, uniqu
 
 def _evaluate_discrete_latent_sampling(encoder_model, args, unique_obs, rev_transform):
     """Evaluate discrete latent space by sampling."""
+    print("evaluating discrete latent sampling----------------------")
     latent_dim = encoder_model.n_latent_embeds
     sampled_latents = torch.randint(0, encoder_model.n_embeddings, (N_RAND_LATENT_SAMPLES, latent_dim))
 

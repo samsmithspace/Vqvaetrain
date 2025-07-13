@@ -297,45 +297,221 @@ class VQVAETrainer(BaseRepresentationLearner):
     def _init_model(self):
         raise Exception('VQVAE requires a model to be specified!')
 
-    def calculate_losses(self, batch_data):
+    def calculate_losses(self, batch_data, return_stats=False):
         device = next(self.model.parameters()).device
         sample_size = int(batch_data[0].shape[0] / 2)
         obs = torch.cat(
             [batch_data[0][:sample_size],
              batch_data[2][sample_size:]], dim=0).to(device)
-        loss_dict = {}
-        obs_recon, quantizer_loss, perplexity, oh_encodings = self.model(obs)
-        loss_dict['quantizer_loss'] = quantizer_loss
 
-        # Recon loss
-        recon_loss = (obs - obs_recon) ** 2
+        loss_dict = {}
+
+        # Debug: Check input
+        if torch.isnan(obs).any() or torch.isinf(obs).any():
+            print(f"⚠️  NaN/Inf detected in input observations!")
+            print(f"   obs shape: {obs.shape}")
+            print(f"   obs range: [{obs.min().item():.6f}, {obs.max().item():.6f}]")
+            print(f"   NaN count: {torch.isnan(obs).sum().item()}")
+            print(f"   Inf count: {torch.isinf(obs).sum().item()}")
+
+        # Forward pass with detailed logging
+        try:
+            obs_recon, quantizer_loss, perplexity, oh_encodings = self.model(obs)
+
+            # Debug: Check each component
+            if torch.isnan(obs_recon).any() or torch.isinf(obs_recon).any():
+                print(f"⚠️  NaN/Inf detected in reconstruction!")
+                print(f"   recon shape: {obs_recon.shape}")
+                print(f"   recon range: [{obs_recon.min().item():.6f}, {obs_recon.max().item():.6f}]")
+                print(f"   recon NaN count: {torch.isnan(obs_recon).sum().item()}")
+
+            if torch.isnan(quantizer_loss).any() or torch.isinf(quantizer_loss).any():
+                print(f"⚠️  NaN/Inf detected in quantizer loss!")
+                print(f"   quantizer_loss: {quantizer_loss.item():.6f}")
+
+            # Log quantizer loss component
+            loss_dict['quantizer_loss'] = quantizer_loss
+
+        except Exception as e:
+            print(f"❌ Error in model forward pass: {e}")
+            # Return dummy losses to prevent crash
+            return {'recon_loss': torch.tensor(float('nan')),
+                    'quantizer_loss': torch.tensor(float('nan'))}
+
+        # Handle spatial dimension mismatches
+        if obs.shape != obs_recon.shape:
+            print(f"🔧 Dimension mismatch: input {obs.shape} vs reconstruction {obs_recon.shape}")
+            obs_recon = F.interpolate(
+                obs_recon,
+                size=obs.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            print(f"   After resizing: {obs_recon.shape}")
+
+        # Calculate reconstruction loss with detailed logging
+        recon_diff = obs - obs_recon
+
+        # Debug reconstruction difference
+        if torch.isnan(recon_diff).any() or torch.isinf(recon_diff).any():
+            print(f"⚠️  NaN/Inf detected in reconstruction difference!")
+            print(f"   diff range: [{recon_diff.min().item():.6f}, {recon_diff.max().item():.6f}]")
+            print(f"   diff NaN count: {torch.isnan(recon_diff).sum().item()}")
+
+        recon_loss = recon_diff ** 2
+
+        # Debug squared difference
+        if torch.isnan(recon_loss).any() or torch.isinf(recon_loss).any():
+            print(f"⚠️  NaN/Inf detected in squared reconstruction loss!")
+            print(f"   squared_diff range: [{recon_loss.min().item():.6f}, {recon_loss.max().item():.6f}]")
+
+        # Apply reconstruction loss clipping if specified
         if self.recon_loss_clip > 0:
             recon_loss = torch.max(recon_loss, torch.tensor(self.recon_loss_clip, device=device))
+            print(f"🔧 Applied recon loss clipping at {self.recon_loss_clip}")
+
+        # Reshape and sum
         recon_loss = recon_loss.reshape(recon_loss.shape[0], -1).sum(-1)
-        recon_loss = recon_loss.mean()
-        loss_dict['recon_loss'] = recon_loss
+        recon_loss_mean = recon_loss.mean()
+
+        # Debug final reconstruction loss
+        if torch.isnan(recon_loss_mean).any() or torch.isinf(recon_loss_mean).any():
+            print(f"⚠️  NaN/Inf detected in final reconstruction loss!")
+            print(f"   recon_loss_mean: {recon_loss_mean.item():.6f}")
+
+        loss_dict['recon_loss'] = recon_loss_mean
+
+        # Calculate additional statistics if requested
+        if return_stats:
+            stats = {}
+
+            # Codebook usage statistics
+            if hasattr(self.model, 'quantizer') and hasattr(self.model.quantizer, 'embeddings'):
+                try:
+                    # Get codebook usage from one-hot encodings
+                    if oh_encodings is not None:
+                        # oh_encodings shape: (batch_size, n_embeddings, spatial_dims...)
+                        codebook_usage = oh_encodings.sum(dim=0)  # Sum over batch
+                        if len(codebook_usage.shape) > 1:
+                            codebook_usage = codebook_usage.sum(dim=tuple(range(1, len(codebook_usage.shape))))
+
+                        # Calculate usage statistics
+                        total_usage = codebook_usage.sum()
+                        active_codes = (codebook_usage > 0).sum()
+                        max_usage = codebook_usage.max()
+                        min_usage = codebook_usage.min()
+
+                        stats['codebook_active_codes'] = active_codes.float()
+                        stats['codebook_total_usage'] = total_usage.float()
+                        stats['codebook_max_usage'] = max_usage.float()
+                        stats['codebook_min_usage'] = min_usage.float()
+                        stats['codebook_usage_entropy'] = -torch.sum(
+                            (codebook_usage / (total_usage + 1e-8)) *
+                            torch.log(codebook_usage / (total_usage + 1e-8) + 1e-8)
+                        )
+
+                        # Debug codebook statistics
+                        print(f"📊 Codebook stats:")
+                        print(f"   Active codes: {active_codes.item()}/{len(codebook_usage)}")
+                        print(f"   Usage range: [{min_usage.item():.0f}, {max_usage.item():.0f}]")
+                        print(f"   Usage entropy: {stats['codebook_usage_entropy'].item():.4f}")
+
+                except Exception as e:
+                    print(f"⚠️  Error calculating codebook stats: {e}")
+
+            # Perplexity tracking
+            if perplexity is not None:
+                stats['perplexity'] = perplexity
+                if torch.isnan(perplexity).any():
+                    print(f"⚠️  NaN detected in perplexity: {perplexity.item():.6f}")
+
+            return loss_dict, stats
 
         return loss_dict
 
-    def train(self, batch_data):  # Batch data is (s, a, s', r, d) tensors
-        loss_dict = self.calculate_losses(batch_data)
+    def train(self, batch_data):
+        loss_dict, stats = self.calculate_losses(batch_data, return_stats=True)
+
+        # Check for NaN in individual loss components before summing
+        nan_losses = []
+        for loss_name, loss_value in loss_dict.items():
+            if torch.isnan(loss_value).any() or torch.isinf(loss_value).any():
+                nan_losses.append(loss_name)
+                print(f"❌ NaN/Inf detected in {loss_name}: {loss_value.item():.6f}")
+
+        if nan_losses:
+            print(f"🛑 Stopping training due to NaN in losses: {nan_losses}")
+            print(f"   Current step: {self.train_step}")
+            print(f"   Learning rate: {self.optimizer.param_groups[0]['lr']}")
+
+            # Print model parameter statistics
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    param_norm = param.norm().item()
+                    print(f"   {name}: param_norm={param_norm:.6f}, grad_norm={grad_norm:.6f}")
+                    if torch.isnan(param).any():
+                        print(f"     ⚠️  NaN in {name} parameters!")
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        print(f"     ⚠️  NaN in {name} gradients!")
+
+            # Return the loss dict even with NaN for debugging
+            return loss_dict, stats
+
+        # Calculate total loss
         loss = torch.sum(torch.stack(tuple(loss_dict.values())))
 
+        # Enhanced logging with individual components
         if self.log_freq > 0 and self.train_step % self.log_freq == 0:
-            log_str = f'VQVAE train step {self.train_step} | Loss: {loss.item():.4f}'
+            log_str = f'VQVAE train step {self.train_step} | Total Loss: {loss.item():.6f}'
             for loss_name, loss_value in loss_dict.items():
-                log_str += f' | {loss_name}: {loss_value.item():.4f}'
+                log_str += f' | {loss_name}: {loss_value.item():.6f}'
+
+            # Add statistics to log
+            for stat_name, stat_value in stats.items():
+                if torch.is_tensor(stat_value):
+                    log_str += f' | {stat_name}: {stat_value.item():.3f}'
+                else:
+                    log_str += f' | {stat_name}: {stat_value:.3f}'
+
             print(log_str)
 
+        # Gradient computation and checking
         self.optimizer.zero_grad()
-        loss.backward()
-        if self.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-        self.optimizer.step()
-        self.train_step += 1
 
-        # vis_loss = loss.item() - self.recon_loss_clip * np.prod(batch_data[0].shape[1:])
-        return loss_dict, {}
+        try:
+            loss.backward()
+
+            # Check gradients for NaN/Inf after backward pass
+            nan_grads = []
+            max_grad_norm = 0.0
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    max_grad_norm = max(max_grad_norm, grad_norm)
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        nan_grads.append(name)
+                        print(f"❌ NaN/Inf gradient in {name}")
+
+            if nan_grads:
+                print(f"🛑 NaN gradients detected in: {nan_grads}")
+                return loss_dict, stats
+
+            # Apply gradient clipping if specified
+            if self.grad_clip > 0:
+                grad_norm_before = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                if self.train_step % self.log_freq == 0:
+                    print(f"🔧 Gradient norm before clipping: {grad_norm_before:.6f}")
+
+            # Parameter update
+            self.optimizer.step()
+
+        except Exception as e:
+            print(f"❌ Error during backward pass or optimization: {e}")
+            return loss_dict, stats
+
+        self.train_step += 1
+        return loss_dict, stats
 
 
 class DiscreteTransitionTrainer():

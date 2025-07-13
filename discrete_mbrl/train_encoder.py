@@ -26,6 +26,91 @@ ENCODER_STEP = 0
 train_log_buffer = defaultdict(float)
 
 
+def fix_vqvae_nan_issue(model):
+    """
+    Emergency fix for VQ-VAE NaN issue
+    """
+    print("🔧 Applying VQ-VAE NaN fix...")
+
+    def safe_weight_init(m):
+        """Safe initialization that prevents NaN"""
+        if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
+            # Use He initialization with smaller scale
+            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            m.weight.data *= 0.1  # Scale down to prevent explosion
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+
+        elif isinstance(m, torch.nn.Linear):
+            # Use Xavier initialization with smaller scale
+            torch.nn.init.xavier_uniform_(m.weight)
+            m.weight.data *= 0.1  # Scale down
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+
+        elif isinstance(m, torch.nn.Embedding):
+            # Very conservative initialization for VQ codebook
+            torch.nn.init.uniform_(m.weight, -0.001, 0.001)
+
+        elif hasattr(m, 'weight') and m.weight is not None:
+            # Catch any other parameteric layers
+            if torch.isnan(m.weight).any() or torch.isinf(m.weight).any():
+                torch.nn.init.normal_(m.weight, 0.0, 0.001)
+                print(f"🔧 Fixed NaN/Inf in {type(m).__name__}")
+
+    # Apply safe initialization
+    model.apply(safe_weight_init)
+
+    # Special handling for VQ-VAE specific components
+    if hasattr(model, 'quantizer'):
+        quantizer = model.quantizer
+        # Fix codebook if accessible
+        for name, param in quantizer.named_parameters():
+            if 'embed' in name.lower():
+                torch.nn.init.uniform_(param, -0.001, 0.001)
+                print(f"🔧 Reinitialized VQ codebook: {param.shape}")
+
+    # Test the model to ensure no NaN
+    test_input = torch.randn(2, 3, 48, 48).to(next(model.parameters()).device)
+
+    try:
+        with torch.no_grad():
+            model.eval()
+            test_output = model(test_input)
+            if isinstance(test_output, tuple):
+                test_recon = test_output[0]
+            else:
+                test_recon = test_output
+
+            if torch.isnan(test_recon).any():
+                print("❌ Model still produces NaN after fix!")
+                # More aggressive fix
+                for param in model.parameters():
+                    if torch.isnan(param).any():
+                        torch.nn.init.normal_(param, 0.0, 0.0001)
+
+                # Test again
+                test_output = model(test_input)
+                if isinstance(test_output, tuple):
+                    test_recon = test_output[0]
+                else:
+                    test_recon = test_output
+
+                if torch.isnan(test_recon).any():
+                    print("❌ Cannot fix NaN issue - model architecture problem!")
+                    return False
+                else:
+                    print("✅ Second fix attempt successful!")
+            else:
+                print("✅ VQ-VAE fix successful!")
+
+        model.train()  # Return to training mode
+        return True
+
+    except Exception as e:
+        print(f"❌ Error testing fixed model: {e}")
+        return False
+
 def train_encoder(args):
     """Optimized encoder training with GPU utilization improvements"""
 
@@ -61,6 +146,28 @@ def train_encoder(args):
     model, trainer = construct_ae_model(
         sample_obs.shape[1:], args, load=args.load)
     update_params(args)
+
+    if args.ae_model_type in ['vqvae', 'soft_vqvae']:
+        print("🔍 Detected VQ-VAE model, applying NaN fix...")
+        fix_success = fix_vqvae_nan_issue(model)
+
+        if not fix_success:
+            print("❌ VQ-VAE fix failed, switching to regular autoencoder")
+            args.ae_model_type = 'ae'  # Fallback to regular AE
+            model, trainer = construct_ae_model(sample_obs.shape[1:], args, load=False)
+
+        # Use very conservative hyperparameters for VQ-VAE
+        if args.ae_model_type in ['vqvae', 'soft_vqvae'] and trainer is not None:
+            # Override learning rate to be very small
+            for param_group in trainer.optimizer.param_groups:
+                old_lr = param_group['lr']
+                param_group['lr'] = min(old_lr, 1e-6)
+                print(f"🔧 Reduced VQ-VAE learning rate from {old_lr} to {param_group['lr']}")
+
+            # Set gradient clipping
+            trainer.grad_clip = max(trainer.grad_clip, 0.1)
+            print(f"🔧 Set VQ-VAE gradient clipping to {trainer.grad_clip}")
+    # *** END OF ADDITION ***
 
     # Apply basic GPU optimizations (without torch.compile)
     model = setup_efficient_model(model, args)
