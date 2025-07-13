@@ -51,7 +51,7 @@ def debug_tensor_shapes(batch_data, step_name=""):
 
 def fix_batch_data_shapes(batch_data, n_train_unroll=1):
     """
-    Fix tensor shapes for multi-step training data with proper validation
+    Fix tensor shapes and data types for multi-step training data
     """
     if not batch_data or not torch.is_tensor(batch_data[0]):
         return batch_data
@@ -72,25 +72,34 @@ def fix_batch_data_shapes(batch_data, n_train_unroll=1):
                 if i in [0, 2] and len(x.shape) == 5:  # Observations (obs, next_obs)
                     # Reshape from [batch, n_steps, C, H, W] to [batch * n_steps, C, H, W]
                     new_shape = [batch_size * n_steps] + list(x.shape[2:])
-                    reshaped = x.reshape(new_shape)
+                    reshaped = x.reshape(new_shape).float()  # Ensure float for observations
                     fixed_data.append(reshaped)
                 elif len(x.shape) == 2:  # Actions, rewards, dones [batch, n_steps]
-                    # FIXED: Reshape to [batch * n_steps, 1] to maintain 2D for actions
-                    if i == 1:  # actions - need to maintain 2D
+                    if i == 1:  # actions - CRITICAL: ensure integer type
                         reshaped = x.reshape(-1, 1)
-                    else:  # rewards, dones - can be 1D
+                        # Force conversion to long, handling any data type
+                        if reshaped.dtype != torch.long:
+                            reshaped = reshaped.long()
+                        fixed_data.append(reshaped)
+                    elif i in [3, 4]:  # rewards, dones
+                        reshaped = x.reshape(-1).float()
+                        fixed_data.append(reshaped)
+                    else:
                         reshaped = x.reshape(-1)
-                    fixed_data.append(reshaped)
+                        fixed_data.append(reshaped)
                 elif len(x.shape) == 3 and i in [1, 3, 4]:  # Could be [batch, n_steps, action_dim]
                     batch_size, n_steps = x.shape[:2]
-                    if i == 1:  # actions - maintain action dimension
+                    if i == 1:  # actions - maintain action dimension and ensure integer type
                         reshaped = x.reshape(batch_size * n_steps, -1)
+                        if reshaped.dtype != torch.long:
+                            reshaped = reshaped.long()
+                        fixed_data.append(reshaped)
                     else:
                         if x.shape[2] == 1:
-                            reshaped = x.reshape(-1)
+                            reshaped = x.reshape(-1).float()
                         else:
-                            reshaped = x.reshape(batch_size * n_steps, -1)
-                    fixed_data.append(reshaped)
+                            reshaped = x.reshape(batch_size * n_steps, -1).float()
+                        fixed_data.append(reshaped)
                 else:
                     fixed_data.append(x)
             else:
@@ -99,11 +108,14 @@ def fix_batch_data_shapes(batch_data, n_train_unroll=1):
         return fixed_data
 
     elif len(obs.shape) == 4:  # [batch, channels, height, width] - already processed
-        # Still need to ensure actions are 2D if they're 1D
+        # Still need to ensure actions are 2D and integer type if they're 1D
         fixed_data = []
         for i, x in enumerate(batch_data):
-            if i == 1 and torch.is_tensor(x) and len(x.shape) == 1:  # actions
-                fixed_data.append(x.unsqueeze(-1))  # Add action dimension
+            if i == 1 and torch.is_tensor(x):  # actions
+                if len(x.shape) == 1:
+                    fixed_data.append(x.unsqueeze(-1).long())  # Add action dimension and ensure long
+                else:
+                    fixed_data.append(x.long())  # Ensure long type
             else:
                 fixed_data.append(x)
         return fixed_data
@@ -115,8 +127,8 @@ def fix_batch_data_shapes(batch_data, n_train_unroll=1):
             if torch.is_tensor(x) and x.dim() >= 2:
                 fixed_data.append(x.unsqueeze(0))
             elif torch.is_tensor(x) and x.dim() == 1:
-                if i == 1:  # actions - ensure 2D
-                    fixed_data.append(x.unsqueeze(0).unsqueeze(-1))
+                if i == 1:  # actions - ensure 2D and integer type
+                    fixed_data.append(x.unsqueeze(0).unsqueeze(-1).long())
                 else:
                     fixed_data.append(x.unsqueeze(0))
             else:
@@ -129,11 +141,19 @@ def fix_batch_data_shapes(batch_data, n_train_unroll=1):
 
 def safe_n_step_calculate_losses(trainer, batch_data, n_train_unroll):
     """
-    Safely calculate losses for n-step training with proper tensor handling
+    Safely calculate losses for n-step training with proper tensor handling and data type checking
     """
     # Extract data
     obs, actions, next_obs, rewards, dones = batch_data[:5]
     extra_data = batch_data[5:] if len(batch_data) > 5 else []
+
+    # CRITICAL: Ensure actions are always LongTensor before any processing
+    if actions.dtype != torch.long:
+        print(f"Converting actions from {actions.dtype} to long")
+        actions = actions.long()
+
+    # Update batch_data with corrected actions
+    batch_data = [obs, actions, next_obs, rewards, dones] + extra_data
 
     if n_train_unroll > 1:
         # For n-step training, we need to reshape the flattened data back to sequences
@@ -164,6 +184,10 @@ def safe_n_step_calculate_losses(trainer, batch_data, n_train_unroll):
         dones = dones.reshape(batch_size, n_train_unroll, *dones.shape[1:]) if dones.dim() > 1 else dones.reshape(
             batch_size, n_train_unroll)
 
+        # CRITICAL: Ensure actions remain LongTensor after reshaping
+        if actions.dtype != torch.long:
+            actions = actions.long()
+
         # Reconstruct batch_data with proper shapes
         reshaped_batch_data = [obs, actions, next_obs, rewards, dones]
         for x in extra_data:
@@ -175,12 +199,18 @@ def safe_n_step_calculate_losses(trainer, batch_data, n_train_unroll):
 
         batch_data = reshaped_batch_data
 
+    # Final check: ensure actions are still LongTensor
+    if batch_data[1].dtype != torch.long:
+        print(f"Final conversion: actions from {batch_data[1].dtype} to long")
+        batch_data[1] = batch_data[1].long()
+
     # Now call the original calculate_losses with the properly shaped data
     try:
         return trainer.calculate_losses(batch_data, n=n_train_unroll)
     except Exception as e:
         print(f"Error in calculate_losses: {e}")
         print(f"Final batch_data shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in batch_data]}")
+        print(f"Actions dtype: {batch_data[1].dtype}")
         raise
 
 

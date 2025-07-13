@@ -577,12 +577,18 @@ def _evaluate_continuous_latent_sampling(encoder_model, all_latents, args, uniqu
 
 
 def _evaluate_discrete_latent_sampling(encoder_model, args, unique_obs, rev_transform):
-    """Evaluate discrete latent space by sampling."""
+    """Evaluate discrete latent space by sampling with proper handling"""
     print("evaluating discrete latent sampling----------------------")
-    latent_dim = encoder_model.n_latent_embeds
-    sampled_latents = torch.randint(0, encoder_model.n_embeddings, (N_RAND_LATENT_SAMPLES, latent_dim))
 
-    _sample_and_log_latents(encoder_model, sampled_latents, args, unique_obs,
+    # Generate indices in the proper format for VQ-VAE
+    batch_size = N_RAND_LATENT_SAMPLES
+    n_positions = encoder_model.n_latent_embeds
+
+    # Sample random indices for each latent position
+    sampled_indices = torch.randint(0, encoder_model.n_embeddings,
+                                    (batch_size, n_positions), dtype=torch.long)
+
+    _sample_and_log_latents(encoder_model, sampled_indices, args, unique_obs,
                             rev_transform, 'uniform_disc', exact_comp=args.exact_comp)
 
 
@@ -705,7 +711,7 @@ def evaluate_transition_model(encoder_model, trans_model, args, target_size, uni
 def _evaluate_single_step(step, obs, acts, next_obs, rewards, dones, gammas, z,
                           encoder_model, trans_model, args, target_size, unique_obs,
                           trans_dict, n_step_stats):
-    """Evaluate transition model for a single step."""
+    """Evaluate transition model for a single step with proper data type handling."""
     # Resize next observations if needed
     next_obs_device = next_obs[:, step].to(args.device)
     if target_size:
@@ -717,13 +723,25 @@ def _evaluate_single_step(step, obs, acts, next_obs, rewards, dones, gammas, z,
     if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
         next_z = next_z.reshape(next_z.shape[0], encoder_model.latent_dim)
 
+    # CRITICAL FIX: Ensure z is LongTensor for discrete models before one_hot conversion
+    if args.trans_model_type in DISCRETE_TRANS_TYPES:
+        if z.dtype != torch.long:
+            print(f"Converting z from {z.dtype} to long for one_hot")
+            z = z.long()
+        z_logits = F.one_hot(z, encoder_model.n_embeddings).permute(0, 2, 1).float() * 1e6
+    else:
+        z_logits = z
+
     # FIX: Add .unsqueeze(-1) to make actions 2D for discrete transition models
     action_tensor = acts[:, step].to(args.device)
     if args.trans_model_type in DISCRETE_TRANS_TYPES:
         action_tensor = action_tensor.unsqueeze(-1)
+        # CRITICAL: Ensure action_tensor is LongTensor
+        if action_tensor.dtype != torch.long:
+            action_tensor = action_tensor.long()
 
     next_z_pred_logits, next_reward_pred, next_gamma_pred = \
-        trans_model(z, action_tensor, return_logits=True)
+        trans_model(z_logits, action_tensor, return_logits=True)
 
     next_z_pred = trans_model.logits_to_state(next_z_pred_logits)
     if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
@@ -736,6 +754,7 @@ def _evaluate_single_step(step, obs, acts, next_obs, rewards, dones, gammas, z,
         encoder_model, init_obs=obs[:, 0], all_obs=unique_obs, all_trans=trans_dict,
         curr_z=z, acts=acts[:, step], env_name=args.env_name)
     update_losses(n_step_stats, loss_dict, args, step + 1)
+
 
 def _log_transition_stats(n_step_stats, args):
     """Log aggregated transition model statistics."""

@@ -181,18 +181,60 @@ class StableVQVAEModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def encode(self, x, return_indices=False):
-        """Encode input to latent codes"""
+        """Encode input to latent codes with proper data type handling"""
         z_e = self.encoder(x)
         z_q, _, _, encodings = self.quantizer(z_e)
 
         if return_indices:
             indices = torch.argmax(encodings, dim=1)
             indices = indices.view(x.shape[0], -1)
+            # CRITICAL: Ensure indices are LongTensor
+            if indices.dtype != torch.long:
+                indices = indices.long()
             return indices
         return z_q
 
     def decode(self, z_q):
         """Decode quantized latents to reconstruction"""
+        # Handle case where z_q is indices rather than spatial features
+        if len(z_q.shape) == 2 and z_q.dtype in [torch.long, torch.int32, torch.int64]:
+            # This is likely indices from discrete latent sampling
+            # Convert indices to embeddings first
+            batch_size, n_positions = z_q.shape
+
+            # Get embeddings for the indices
+            flat_indices = z_q.reshape(-1)
+            embeddings = self.quantizer.embeddings(flat_indices)
+
+            # Reshape to spatial format for decoder
+            # Infer spatial dimensions from n_positions
+            spatial_size = int(np.sqrt(n_positions))
+            if spatial_size * spatial_size == n_positions:
+                # Square spatial layout
+                z_q = embeddings.reshape(batch_size, spatial_size, spatial_size, self.embedding_dim)
+                z_q = z_q.permute(0, 3, 1, 2)  # BHWC -> BCHW
+            else:
+                # Non-square layout - try to find reasonable dimensions
+                for h in range(1, n_positions + 1):
+                    if n_positions % h == 0:
+                        w = n_positions // h
+                        if h * w == n_positions:
+                            z_q = embeddings.reshape(batch_size, h, w, self.embedding_dim)
+                            z_q = z_q.permute(0, 3, 1, 2)  # BHWC -> BCHW
+                            break
+                else:
+                    # Fallback: create square layout with padding/truncation
+                    spatial_size = int(np.ceil(np.sqrt(n_positions)))
+                    padded_size = spatial_size * spatial_size
+                    if padded_size > n_positions:
+                        # Pad with zeros
+                        padding = torch.zeros(batch_size, padded_size - n_positions, self.embedding_dim,
+                                              device=z_q.device, dtype=embeddings.dtype)
+                        embeddings = torch.cat([embeddings.reshape(batch_size, n_positions, self.embedding_dim),
+                                                padding], dim=1)
+                    z_q = embeddings.reshape(batch_size, spatial_size, spatial_size, self.embedding_dim)
+                    z_q = z_q.permute(0, 3, 1, 2)  # BHWC -> BCHW
+
         return self.decoder(z_q)
 
     def forward(self, x):

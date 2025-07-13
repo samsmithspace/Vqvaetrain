@@ -110,7 +110,9 @@ class DiscreteTransitionModel(nn.Module):
     # when using soft embeddings
     return_one_hots = return_one_hots or self.use_soft_embeds
     return_logits = return_logits or self.return_logits
-
+    if hasattr(self, 'embeddings') and x.dtype != torch.long:
+        print(f"Warning: Converting input from {x.dtype} to long for embedding lookup")
+        x = x.long()
     embeds = self.embeddings(x)
     flat_embeds = embeds.view(embeds.shape[0], -1)
     processed_acts = self.prepare_acts(acts)
