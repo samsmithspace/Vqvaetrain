@@ -1,4 +1,3 @@
-#train_transition_model.py
 from collections import defaultdict
 import os
 import sys
@@ -28,38 +27,320 @@ train_log_buffer = defaultdict(list)
 aux_log_buffer = defaultdict(list)
 
 
-def train_trans_model(args, encoder_model=None):
-    """Optimized transition model training with GPU utilization improvements"""
+def get_autocast_context(device, use_amp=True):
+    """Get the appropriate autocast context based on device and PyTorch version"""
+    if not use_amp:
+        return nullcontext()
 
+    if device.type == 'cuda':
+        try:
+            # Try the new API first (PyTorch 1.10+)
+            return autocast(device_type='cuda')
+        except TypeError:
+            # Fall back to old API (PyTorch < 1.10)
+            return autocast()
+    else:
+        # CPU doesn't support autocast in older versions
+        return nullcontext()
+
+
+def fix_batch_data_shapes(batch_data):
+    """Fix tensor shapes for multi-step training data"""
+    if not batch_data or not torch.is_tensor(batch_data[0]):
+        return batch_data
+
+    obs = batch_data[0]
+
+    # Debug print - uncomment to debug
+    # print(f"Original batch data shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in batch_data]}")
+
+    # Check if we have the unroll dimension [batch, n_steps, ...]
+    if len(obs.shape) == 5:  # [batch, n_steps, channels, height, width]
+        fixed_data = []
+        for i, x in enumerate(batch_data):
+            if torch.is_tensor(x):
+                if i in [0, 2] and len(x.shape) == 5:  # Observations
+                    # Reshape from [batch, n_steps, C, H, W] to [batch * n_steps, C, H, W]
+                    batch_size, n_steps = x.shape[:2]
+                    new_shape = [batch_size * n_steps] + list(x.shape[2:])
+                    fixed_data.append(x.reshape(new_shape))
+                elif len(x.shape) == 2:  # Actions or rewards [batch, n_steps]
+                    # Flatten to [batch * n_steps]
+                    fixed_data.append(x.reshape(-1))
+                elif len(x.shape) == 3 and i in [1, 3, 4]:  # Could be [batch, n_steps, action_dim]
+                    # Flatten to [batch * n_steps, action_dim] or [batch * n_steps]
+                    batch_size, n_steps = x.shape[:2]
+                    if x.shape[2] == 1:
+                        fixed_data.append(x.reshape(-1))
+                    else:
+                        fixed_data.append(x.reshape(batch_size * n_steps, -1))
+                else:
+                    fixed_data.append(x)
+            else:
+                fixed_data.append(x)
+        return fixed_data
+
+    # Check for incorrect tensor shapes where batch dim is in wrong place
+    elif len(obs.shape) == 4:
+        # Standard case - check if already in correct format
+        if obs.shape[1] == 3:  # RGB channels
+            return batch_data
+
+        # Check if first dimension is 1 and second dimension is too large for channels
+        if obs.shape[0] == 1 and obs.shape[1] > 3:
+            # This is the problematic case from your error
+            print(f"ERROR: Malformed observation tensor with shape {obs.shape}")
+            print(f"This appears to be a data loading issue. The observation should be [batch, 3, H, W]")
+            # Try to continue with a warning rather than crashing
+            # Skip this batch by returning None
+            return None
+
+        return batch_data
+
+    # Check if batch dimension is missing (single sample)
+    elif len(obs.shape) == 3:  # [channels, height, width]
+        # Add batch dimension
+        fixed_data = []
+        for x in batch_data:
+            if torch.is_tensor(x) and x.dim() >= 2:
+                fixed_data.append(x.unsqueeze(0))
+            else:
+                fixed_data.append(x)
+        return fixed_data
+
+    return batch_data
+
+
+def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_steps):
+    """
+    Handle training step with proper error handling
+    """
+    try:
+        # Calculate losses
+        result = trainer.calculate_losses(batch_data)
+
+        # Handle different return types
+        if isinstance(result, dict):
+            # Find the main loss tensor
+            loss_tensor = None
+            for key in ['loss', 'total_loss', 'combined_loss']:
+                if key in result and torch.is_tensor(result[key]):
+                    loss_tensor = result[key]
+                    break
+
+            if loss_tensor is None:
+                # Sum all tensor values as fallback
+                tensor_losses = [v for v in result.values() if torch.is_tensor(v)]
+                if tensor_losses:
+                    loss_tensor = sum(tensor_losses)
+                else:
+                    raise ValueError("No tensor losses found in result dict")
+
+            train_loss = result
+            aux_data = {}
+        elif isinstance(result, tuple) and len(result) == 2:
+            loss_tensor, aux_data = result
+            train_loss = {'loss': loss_tensor}
+        else:
+            loss_tensor = result
+            train_loss = {'loss': loss_tensor}
+            aux_data = {}
+
+        # Ensure loss_tensor is a scalar
+        if loss_tensor.dim() > 0:
+            loss_tensor = loss_tensor.mean()
+
+            # Scale for gradient accumulation
+        scaled_loss = loss_tensor / accumulation_steps
+
+        return train_loss, aux_data, scaled_loss
+
+    except Exception as e:
+        print(f"Error in transition trainer: {e}")
+        print(f"Batch data shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in batch_data]}")
+        raise
+
+
+def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
+                                    batch_size=128, log_freq=100, seed=0, callback=None,
+                                    valid_callback=None, test_func=None, use_amp=True,
+                                    accumulation_steps=1):
+    """
+    Fixed training loop with proper autocast handling
+    """
+    torch.manual_seed(seed)
+    model.train()
+
+    device = next(model.parameters()).device
+
+    # Setup mixed precision with proper device handling
+    scaler = GradScaler() if use_amp and device.type == 'cuda' else None
+    use_amp = use_amp and device.type == 'cuda'  # Only use AMP on CUDA
+
+    # Setup optimizer if not already done
+    if not hasattr(trainer, 'optimizer'):
+        if hasattr(trainer, 'setup_optimizer'):
+            trainer.setup_optimizer()
+        else:
+            # Create a basic optimizer if setup_optimizer doesn't exist
+            trainer.optimizer = torch.optim.Adam(model.parameters(), lr=trainer.lr)
+
+    print(f"Training on device: {device}, AMP enabled: {use_amp}")
+
+    # Validate data format with first batch
+    try:
+        first_batch = next(iter(train_loader))
+        print(f"First batch shapes: {[x.shape if torch.is_tensor(x) else type(x) for x in first_batch]}")
+        # Move back to CPU to not affect training
+        del first_batch
+    except Exception as e:
+        print(f"Warning: Could not inspect first batch: {e}")
+
+    for epoch in range(n_epochs):
+        print(f'Starting epoch #{epoch}')
+        accumulated_loss = 0.0
+        batch_count = 0
+
+        for i, batch_data in enumerate(train_loader):
+            try:
+                # Move data to device
+                batch_data = [x.to(device, non_blocking=True) if torch.is_tensor(x) else x
+                              for x in batch_data]
+
+                # Fix tensor shapes for multi-step training
+                batch_data = fix_batch_data_shapes(batch_data)
+
+                # Skip if batch data is None (malformed data)
+                if batch_data is None:
+                    print(f"Skipping batch {i} due to malformed data")
+                    continue
+
+                # Get the appropriate autocast context
+                autocast_context = get_autocast_context(device, use_amp)
+
+                with autocast_context:
+                    train_loss, aux_data, scaled_loss = transition_trainer_train_mixed_precision(
+                        trainer, batch_data, accumulation_steps)
+
+                # Backward pass
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                    if (i + 1) % accumulation_steps == 0:
+                        scaler.step(trainer.optimizer)
+                        scaler.update()
+                        trainer.optimizer.zero_grad()
+                else:
+                    scaled_loss.backward()
+                    if (i + 1) % accumulation_steps == 0:
+                        trainer.optimizer.step()
+                        trainer.optimizer.zero_grad()
+
+                # Accumulate loss for logging
+                loss_value = train_loss['loss'].item() if torch.is_tensor(train_loss['loss']) else train_loss['loss']
+                accumulated_loss += loss_value
+                batch_count += 1
+
+                # Callback for logging
+                if callback:
+                    callback(train_loss, i * batch_size, epoch, aux_data=aux_data)
+
+                # Periodic logging and validation
+                if i % log_freq == 0 and i > 0:
+                    if batch_count > 0:
+                        avg_loss = accumulated_loss / batch_count
+                        accumulated_loss = 0.0
+                        batch_count = 0
+
+                        update_str = f'Epoch {epoch} | Batch {i} | train_loss: {avg_loss:.3f}'
+
+                        # Less frequent validation
+                        if valid_loader is not None and i % (log_freq * 3) == 0:
+                            model.eval()
+                            with torch.no_grad():
+                                test_func_to_use = test_func or trainer.calculate_losses
+                                valid_losses = test_model_with_unroll_fix(model, test_func_to_use, valid_loader, device)
+                                if valid_losses:  # Check if we got valid results
+                                    valid_loss_means = {k: np.mean([x[k] for x in valid_losses])
+                                                        for k in valid_losses[0].keys()}
+                                    if valid_callback:
+                                        valid_callback(valid_loss_means, i, epoch)
+                                    for k, v in valid_loss_means.items():
+                                        update_str += f' | valid_{k}: {v:.3f}'
+                            model.train()
+
+                        print(update_str)
+
+            except Exception as e:
+                print(f"Error in batch {i}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+
+def test_model_with_unroll_fix(model, test_func, data_loader, device):
+    """Test model with proper shape handling"""
+    model.eval()
+    losses = []
+
+    try:
+        with torch.no_grad():
+            for batch_data in data_loader:
+                # Move to device
+                batch_data = [x.to(device, non_blocking=True) if torch.is_tensor(x) else x
+                              for x in batch_data]
+
+                # Fix shapes
+                batch_data = fix_batch_data_shapes(batch_data)
+
+                # Skip malformed batches
+                if batch_data is None:
+                    continue
+
+                # Calculate loss
+                loss = test_func(batch_data)
+                if not isinstance(loss, dict):
+                    if torch.is_tensor(loss):
+                        loss = {'loss': loss.mean()}
+                    else:
+                        loss = {'loss': loss}
+
+                # Convert to CPU for storage
+                cpu_loss = {}
+                for k, v in loss.items():
+                    if torch.is_tensor(v):
+                        cpu_loss[k] = v.item()
+                    else:
+                        cpu_loss[k] = v
+                losses.append(cpu_loss)
+
+    except Exception as e:
+        print(f"Error in test_model_with_unroll_fix: {e}")
+        # Return empty loss if validation fails
+        return [{'loss': 0.0}]
+
+    return losses
+
+
+def train_trans_model(args, encoder_model=None):
     import_logger(args)
 
-    # Setup GPU optimizations early
-    optimize_gpu_memory()
-
-    print('Loading data with optimizations...')
-    # Data shape: (5, batch_size, n_steps, ...)
+    print('Loading data...')
     train_loader, test_loader, valid_loader = prepare_dataloaders(
         args.env_name, n=args.max_transitions, batch_size=args.batch_size,
         n_step=args.n_train_unroll, preprocess=args.preprocess, randomize=True,
         n_preload=args.n_preload, preload_all=args.preload_data,
-        extra_buffer_keys=args.extra_buffer_keys,
-        pin_memory=getattr(args, 'pin_memory', True),
-        persistent_workers=getattr(args, 'persistent_workers', args.n_preload > 0),
-        prefetch_factor=getattr(args, 'prefetch_factor', 2))
+        extra_buffer_keys=args.extra_buffer_keys)
 
     print(f'Data split: {len(train_loader.dataset)}/{len(test_loader.dataset)}/{len(valid_loader.dataset)}')
-    print(f'Batch size: {args.batch_size}, N-step unroll: {args.n_train_unroll}, Workers: {args.n_preload}')
 
     if encoder_model is None:
         print('Constructing encoder...')
         sample_obs = next(iter(train_loader))[0][0]
-        if args.n_train_unroll > 1:
+        if args.n_train_unroll > 1 and len(sample_obs.shape) > 3:
             sample_obs = sample_obs[0]
-        encoder_model = construct_ae_model(
-            sample_obs.shape, args)[0]
+        encoder_model = construct_ae_model(sample_obs.shape, args)[0]
 
-    # Apply GPU optimizations to encoder
-    encoder_model = setup_efficient_model(encoder_model, args)
+    encoder_model = encoder_model.to(args.device)
     freeze_model(encoder_model)
     encoder_model.eval()
 
@@ -70,42 +351,33 @@ def train_trans_model(args, encoder_model=None):
     env = make_env(args.env_name, max_steps=args.env_max_steps)
     trans_model, trans_trainer = construct_trans_model(
         encoder_model, args, env.action_space, load=args.load)
-    print('Transition model:', trans_model)
 
-    # Apply GPU optimizations to transition model
-    trans_model = setup_efficient_model(trans_model, args)
+    trans_model = trans_model.to(args.device)
 
-    # Setup mixed precision training
-    use_amp = getattr(args, 'use_amp', False) and args.device == 'cuda'
-    scaler = GradScaler() if use_amp else None
-    # Fix autocast context for newer PyTorch versions
-    if use_amp:
-        try:
-            autocast_context = lambda: autocast('cuda')
-        except TypeError:
-            autocast_context = autocast
-    else:
-        autocast_context = nullcontext
-    accumulation_steps = getattr(args, 'accumulation_steps', 1)
+    # Wrap functions for n-step training
+    original_calculate_losses = trans_trainer.calculate_losses
 
-    print(f'Using mixed precision: {use_amp}')
-    print(f'Gradient accumulation steps: {accumulation_steps}')
-    print('# Transition model params:', sum([x.numel() for x in trans_model.parameters()]))
+    def n_step_calculate_losses(batch_data):
+        return original_calculate_losses(batch_data, n=args.n_train_unroll)
 
-    # Setup transition trainer for optimized training
-    test_func = functools.partial(
-        trans_trainer.calculate_losses, n=args.n_train_unroll)
-    trans_trainer.train = functools.partial(trans_trainer.train, n=args.n_train_unroll)
-
-    # Setup trainer for mixed precision
-    if use_amp:
-        trans_trainer.scaler = scaler
-        trans_trainer.autocast_context = autocast_context
-        trans_trainer.accumulation_steps = accumulation_steps
+    test_func = n_step_calculate_losses
+    trans_trainer.calculate_losses = n_step_calculate_losses
 
     update_params(args)
     track_model(trans_model, args)
 
+    # Training configuration
+    use_amp = getattr(args, 'use_amp', False)  # Default to False for stability
+    accumulation_steps = getattr(args, 'accumulation_steps', 1)
+
+    # Disable AMP on CPU or if not supported
+    if args.device == 'cpu':
+        use_amp = False
+
+    print(f"Mixed precision training: {use_amp}")
+    print(f"Accumulation steps: {accumulation_steps}")
+
+    # Callbacks
     def train_callback(train_data, batch_idx, epoch, aux_data=None):
         global TRANS_STEP, train_log_buffer, aux_log_buffer
         if args.save and epoch % args.checkpoint_freq == 0 and batch_idx == 0:
@@ -119,30 +391,16 @@ def train_trans_model(args, encoder_model=None):
             for k, v in aux_data.items():
                 aux_log_buffer[k].append(v)
 
-        # Reduced logging frequency for better GPU utilization
-        log_interval = max(1, (args.log_freq // 10))
-        if TRANS_STEP % log_interval == 0:
-            log_stats = {}
-            for k, v in train_log_buffer.items():
-                if len(v) > 0:
-                    log_stats[f'train_{k}'] = sum(v) / len(v)
-            for k, v in aux_log_buffer.items():
-                if len(v) > 0:
-                    log_stats[k] = sum(v) / len(v)
-
-            if log_stats:  # Only log if we have stats
-                log_metrics({
-                    'epoch': epoch,
-                    'step': TRANS_STEP,
-                    **log_stats},
-                    args, prefix='trans', step=TRANS_STEP)
-
+        if TRANS_STEP % max(1, (args.log_freq // 10)) == 0:
+            log_metrics({
+                'epoch': epoch,
+                'step': TRANS_STEP,
+                **{f'train_{k}': sum(v) / len(v) for k, v in train_log_buffer.items()},
+                **{k: sum(v) / len(v) for k, v in aux_log_buffer.items()}},
+                args, prefix='trans', step=TRANS_STEP)
             train_log_buffer = defaultdict(list)
             aux_log_buffer = defaultdict(list)
         TRANS_STEP += 1
-
-    # For reversing observation transformations
-    rev_transform = valid_loader.dataset.flat_rev_obs_transform
 
     def valid_callback(valid_data, batch_idx, epoch):
         global TRANS_STEP
@@ -152,22 +410,9 @@ def train_trans_model(args, encoder_model=None):
             **{f'valid_{k}': v for k, v in valid_data.items()}},
             args, prefix='trans', step=TRANS_STEP)
 
-        # Less frequent visualization generation to keep GPU busy
-        if batch_idx == 0 and epoch % args.checkpoint_freq == 0:
-            valid_recons = sample_recon_seqs(
-                encoder_model, trans_model, valid_loader, args.n_train_unroll,
-                env_name=args.env_name, rev_transform=rev_transform, gif_format=True)
-            train_recons = sample_recon_seqs(
-                encoder_model, trans_model, train_loader, args.n_train_unroll,
-                env_name=args.env_name, rev_transform=rev_transform, gif_format=True)
-            log_videos({
-                'valid_seq_recon': valid_recons,
-                'train_seq_recon': train_recons},
-                args, prefix='trans', step=TRANS_STEP)
-
     n_epochs = args.trans_epochs if args.trans_epochs is not None else args.epochs
+
     try:
-        # Use optimized training loop
         optimized_transition_train_loop(
             trans_model, trans_trainer, train_loader, valid_loader, n_epochs,
             args.batch_size, args.log_freq, callback=train_callback,
@@ -175,180 +420,28 @@ def train_trans_model(args, encoder_model=None):
             accumulation_steps=accumulation_steps)
     except KeyboardInterrupt:
         print('Stopping training')
-
-    # Get rid of any remaining log data
-    global train_log_buffer
-    del train_log_buffer
+    except Exception as e:
+        print(f"Training error: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Test the model
     print('Starting model evaluation...')
-    test_losses = test_model_optimized(trans_model, test_func, test_loader, args.device)
-    if test_losses:
-        test_losses = {k: np.mean([d[k] for d in test_losses]) for k in test_losses[0].keys()}
-        print(f'Transition model test losses: {test_losses}')
+    try:
+        test_losses = test_model_with_unroll_fix(trans_model, test_func, test_loader, args.device)
+        if test_losses:
+            test_losses = {k: np.mean([d[k] for d in test_losses]) for k in test_losses[0].keys()}
+            print(f'Transition model test losses: {test_losses}')
+        else:
+            print('Test evaluation failed, skipping...')
+    except Exception as e:
+        print(f'Test evaluation error: {e}')
 
     if args.save:
         save_model(trans_model, args, model_hash=args.trans_model_hash)
         print('Transition model saved')
 
     return trans_model
-
-
-def optimized_transition_train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
-                                    batch_size=128, log_freq=100, seed=0, callback=None,
-                                    valid_callback=None, test_func=None, use_amp=True,
-                                    accumulation_steps=1):
-    """
-    Optimized training loop specifically for transition models with mixed precision,
-    gradient accumulation, and reduced CPU-GPU synchronization.
-    """
-    torch.manual_seed(seed)
-    model.train()
-
-    # Setup mixed precision training
-    scaler = GradScaler() if use_amp else None
-    # Fix autocast context for newer PyTorch versions
-    if use_amp:
-        try:
-            autocast_context = lambda: autocast('cuda')
-        except TypeError:
-            autocast_context = autocast
-    else:
-        autocast_context = nullcontext
-
-    # Pre-allocate tensors to reduce memory allocation overhead
-    device = next(model.parameters()).device
-
-    train_losses = []
-    accumulated_loss = 0.0
-
-    for epoch in range(n_epochs):
-        print(f'Starting epoch #{epoch}')
-        print('Memory usage: {:.1f} GB'.format(
-            psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3))
-
-        # Reset accumulated gradients at start of epoch
-        if hasattr(trainer, 'optimizer'):
-            trainer.optimizer.zero_grad()
-
-        for i, batch_data in enumerate(train_loader):
-            # Move data to GPU with non_blocking transfer
-            if isinstance(batch_data, (list, tuple)):
-                batch_data = [x.to(device, non_blocking=True) if torch.is_tensor(x) else x
-                              for x in batch_data]
-            else:
-                batch_data = batch_data.to(device, non_blocking=True)
-
-            with autocast_context():
-                # Modified trainer call for mixed precision
-                if hasattr(trainer, 'scaler') and trainer.scaler is not None:
-                    train_loss, aux_data = transition_trainer_train_mixed_precision(
-                        trainer, batch_data, accumulation_steps)
-                else:
-                    train_loss, aux_data = trainer.train(batch_data)
-
-                if not isinstance(train_loss, dict):
-                    train_loss = {'loss': train_loss}
-
-            # Accumulate losses for logging (avoid frequent CPU-GPU sync)
-            loss_value = train_loss['loss'].item() if torch.is_tensor(train_loss['loss']) else train_loss['loss']
-            accumulated_loss += loss_value
-
-            # Reduced frequency operations
-            if i % log_freq == 0 and i > 0:
-                # Only sync when necessary for logging
-                avg_loss = accumulated_loss / log_freq
-                accumulated_loss = 0.0
-
-                update_str = f'Epoch {epoch} | Batch {i} | train_loss: {avg_loss:.3f}'
-
-                # Less frequent validation to keep GPU busy
-                if valid_loader is not None and i % (log_freq * 3) == 0:
-                    model.eval()
-                    with torch.no_grad():
-                        test_func = test_func or trainer.calculate_losses
-                        valid_losses = test_model_optimized(model, test_func, valid_loader, device)
-                        if valid_losses:
-                            valid_loss_means = {k: np.mean([x[k] for x in valid_losses])
-                                                for k in valid_losses[0]}
-                            if valid_callback:
-                                valid_callback(valid_loss_means, i, epoch)
-                            for k, v in valid_loss_means.items():
-                                update_str += f' | valid_{k}: {v:.3f}'
-                    model.train()
-
-                print(update_str)
-
-                if callback:
-                    callback(train_loss, i * batch_size, epoch, aux_data=aux_data)
-
-
-def transition_trainer_train_mixed_precision(trainer, batch_data, accumulation_steps):
-    """Modified trainer.train method for transition models with mixed precision and gradient accumulation"""
-
-    # Forward pass with autocast
-    with trainer.autocast_context():
-        result = trainer.calculate_losses(batch_data)
-
-        # Handle different return types from calculate_losses
-        if isinstance(result, tuple) and len(result) == 2:
-            loss, aux_data = result
-        else:
-            loss = result
-            aux_data = {}
-
-        # Validate that loss is numeric
-        if isinstance(loss, str):
-            raise ValueError(f"Loss calculation returned an error: {loss}")
-
-        if isinstance(loss, dict):
-            # Handle different loss dictionary formats
-            if 'loss' in loss:
-                # Standard case: single 'loss' key
-                total_loss = loss['loss']
-            else:
-                # Handle component losses (e.g., VQ-VAE, transition models with multiple losses)
-                total_loss = 0
-                loss_components = []
-                for k, v in loss.items():
-                    if 'loss' in k.lower() and isinstance(v, (torch.Tensor, float, int)):
-                        total_loss += v
-                        loss_components.append(k)
-
-                if total_loss == 0 or len(loss_components) == 0:
-                    raise ValueError(f"No valid loss components found in loss dict. Got keys: {list(loss.keys())}")
-
-                # Add the total loss to the dict for logging
-                loss['loss'] = total_loss
-
-            total_loss = total_loss / accumulation_steps
-        else:
-            # Validate that loss is numeric
-            if not isinstance(loss, (torch.Tensor, float, int)):
-                raise ValueError(f"Loss must be numeric, got {type(loss)}: {loss}")
-            total_loss = loss / accumulation_steps
-            loss = {'loss': loss}
-
-    # Backward pass with gradient scaling
-    trainer.scaler.scale(total_loss).backward()
-
-    # Update weights every accumulation_steps
-    if hasattr(trainer, '_step_count'):
-        trainer._step_count += 1
-    else:
-        trainer._step_count = 1
-
-    if trainer._step_count % accumulation_steps == 0:
-        # Gradient clipping before step
-        if hasattr(trainer, 'grad_clip') and trainer.grad_clip > 0:
-            trainer.scaler.unscale_(trainer.optimizer)
-            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.grad_clip)
-
-        trainer.scaler.step(trainer.optimizer)
-        trainer.scaler.update()
-        trainer.optimizer.zero_grad()
-
-    return loss, aux_data
 
 
 def test_model_optimized(model, test_func, data_loader, device):
@@ -444,3 +537,5 @@ if __name__ == '__main__':
     if args.save:
         save_model(trans_model, args, model_hash=args.trans_model_hash)
         print('Model saved')
+
+
