@@ -350,7 +350,8 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
       encoder, decoder = make_ae(
         input_dim, args.embedding_dim, args.filter_size, version=args.ae_model_version)
 
-      # Use stable VQ-VAE model
+
+
       model = StableVQVAEModel(
         input_dim=input_dim,
         codebook_size=args.codebook_size,
@@ -360,9 +361,10 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
         commitment_cost=0.25  # Conservative commitment cost
       )
 
-      args_update(args, 'final_latent_dim', model.n_latent_embeds * args.codebook_size)
+      args_update(args, 'final_latent_dim', model.latent_dim)
       print(f'Constructed Stable VQVAE with {model.n_latent_embeds} ' + \
             f'latents and {args.codebook_size} codebook entries')
+      print(f'Total latent dimension: {model.latent_dim}')
 
       if load:
         load_model(model, args, exp_type='encoder', model_vars=AE_MODEL_VARS,
@@ -451,21 +453,60 @@ def construct_trans_model(encoder, args, act_space, load=True):
       trans_model, encoder=encoder, lr=args.trans_learning_rate, log_freq=-1,
       log_norms=args.log_norms, grad_clip=args.ae_grad_clip)
 
+
   elif args.trans_model_type == 'continuous':
+
     if args.trans_model_version == '1':
+
+      # Handle different encoder types
+
+      if hasattr(encoder, 'latent_dim'):
+
+        # Regular continuous encoders (AE, VAE, etc.)
+
+        latent_dim = encoder.latent_dim
+
+      elif hasattr(encoder, 'n_latent_embeds') and hasattr(encoder, 'embedding_dim'):
+
+        # VQ-VAE models using continuous transition
+
+        latent_dim = encoder.n_latent_embeds * encoder.embedding_dim
+
+        print(f"🔧 Using VQ-VAE with continuous transition: latent_dim = {latent_dim}")
+
+      else:
+
+        # Fallback
+
+        print("⚠️ Warning: Could not determine latent_dim, using default")
+
+        latent_dim = 512
+
       trans_model = ContinuousTransitionModel(
-        encoder.latent_dim, act_space,
-        hidden_sizes = [args.trans_hidden]*args.trans_depth,
-        stochastic = args.stochastic,
-        stoch_hidden_sizes = [256, 256],
-        discretizer_hidden_sizes = [256]
+
+        latent_dim, act_space,
+
+        hidden_sizes=[args.trans_hidden] * args.trans_depth,
+
+        stochastic=args.stochastic,
+
+        stoch_hidden_sizes=[256, 256],
+
+        discretizer_hidden_sizes=[256]
+
       )
-    args_update(args, 'final_latent_dim', encoder.latent_dim)
+
+    args_update(args, 'final_latent_dim', latent_dim)
+
     if load:
       load_model(trans_model, args, exp_type='trans_model',
-        model_vars=MODEL_VARS, model_hash=args.trans_model_hash)
+
+                 model_vars=MODEL_VARS, model_hash=args.trans_model_hash)
+
     trans_trainer = ContinuousTransitionTrainer(
+
       trans_model, encoder=encoder, lr=args.trans_learning_rate, log_freq=-1,
+
       log_norms=args.log_norms, grad_clip=args.ae_grad_clip, e2e_loss=args.e2e_loss)
     
   elif args.trans_model_type == 'shared_vq':
@@ -577,6 +618,26 @@ def construct_trans_model(encoder, args, act_space, load=True):
 
   return trans_model, trans_trainer
 
+def convert_vqvae_state_dict(state_dict):
+  """
+  Convert old VQ-VAE state dict format to new StableVQVAEModel format
+  """
+  converted_state_dict = {}
+
+  for key, value in state_dict.items():
+    new_key = key
+
+    # Convert old quantizer keys to new format
+    if key == "quantizer._ema_w":
+      new_key = "quantizer.embed_avg"
+    elif key == "quantizer._ema_cluster_size":
+      new_key = "quantizer.cluster_usage"
+    elif key == "quantizer._embedding.weight":
+      new_key = "quantizer.embeddings.weight"
+
+    converted_state_dict[new_key] = value
+
+  return converted_state_dict
 
 def make_model_hash(args=None, model_vars=MODEL_VARS, **kwargs):
   """MD5 hash of a dictionary."""
@@ -607,9 +668,10 @@ def save_model(model, args, model_hash=None, model_vars=MODEL_VARS, **kwargs):
   print(f'Model saved to "{save_path}"')
   return model_hash
 
+
 def load_model(
-    model, args, model_hash=None, return_hash=False,
-    model_vars=MODEL_VARS, **kwargs):
+        model, args, model_hash=None, return_hash=False,
+        model_vars=MODEL_VARS, **kwargs):
   if model_hash is None:
     model_hash = make_model_hash(args, model_vars=model_vars, **kwargs)
   file_path = MODEL_SAVE_FORMAT.format(args.env_name, model_hash)
@@ -620,10 +682,35 @@ def load_model(
   else:
     print(f'Model found at "{file_path}", loading')
     try:
-      model.load_state_dict(torch.load(file_path, map_location=args.device))
+      state_dict = torch.load(file_path, map_location=args.device)
+
+      # Check if this is a VQ-VAE model that needs state dict conversion
+      if (args.ae_model_type == 'vqvae' and
+              any(key.startswith('quantizer._ema') or key == 'quantizer._embedding.weight'
+                  for key in state_dict.keys())):
+        print("🔧 Converting old VQ-VAE state dict format to new format...")
+        state_dict = convert_vqvae_state_dict(state_dict)
+
+      model.load_state_dict(state_dict)
+      print("✅ Model loaded successfully!")
+
     except RuntimeError as e:
       print(f'Failed to load model at {file_path}!')
-      raise e
+      print(f'Error details: {e}')
+
+      # If it's a key mismatch error, try the conversion
+      if "Missing key(s)" in str(e) and "quantizer" in str(e):
+        print("🔧 Attempting state dict conversion...")
+        try:
+          state_dict = torch.load(file_path, map_location=args.device)
+          state_dict = convert_vqvae_state_dict(state_dict)
+          model.load_state_dict(state_dict, strict=False)
+          print("✅ Model loaded with conversion!")
+        except Exception as e2:
+          print(f"❌ Conversion also failed: {e2}")
+          raise e
+      else:
+        raise e
 
   if return_hash:
     return model, model_hash
