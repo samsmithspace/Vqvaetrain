@@ -26,9 +26,9 @@ ENCODER_STEP = 0
 train_log_buffer = defaultdict(float)
 
 
-def fix_vqvae_nan_issue(model):
+def fix_vqvae_nan_issue(model, sample_obs_shape):
     """
-    Emergency fix for VQ-VAE NaN issue
+    Emergency fix for VQ-VAE NaN issue - now takes the actual observation shape
     """
     print("🔧 Applying VQ-VAE NaN fix...")
 
@@ -70,8 +70,14 @@ def fix_vqvae_nan_issue(model):
                 torch.nn.init.uniform_(param, -0.001, 0.001)
                 print(f"🔧 Reinitialized VQ codebook: {param.shape}")
 
-    # Test the model to ensure no NaN
-    test_input = torch.randn(2, 3, 48, 48).to(next(model.parameters()).device)
+    # Test the model to ensure no NaN - use the actual sample shape
+    device = next(model.parameters()).device
+
+    # Create test input with the correct shape
+    # Use batch size of 1 to avoid shape issues
+    test_input = torch.randn(1, *sample_obs_shape).to(device)
+
+    print(f"🧪 Testing model with input shape: {test_input.shape}")
 
     try:
         with torch.no_grad():
@@ -103,12 +109,17 @@ def fix_vqvae_nan_issue(model):
                     print("✅ Second fix attempt successful!")
             else:
                 print("✅ VQ-VAE fix successful!")
+                print(f"   Input shape: {test_input.shape}")
+                print(f"   Output shape: {test_recon.shape}")
 
         model.train()  # Return to training mode
         return True
 
     except Exception as e:
         print(f"❌ Error testing fixed model: {e}")
+        print(f"   Input shape: {test_input.shape}")
+        print(f"   Model device: {device}")
+        print(f"   Model type: {type(model).__name__}")
         return False
 
 def train_encoder(args):
@@ -149,7 +160,8 @@ def train_encoder(args):
 
     if args.ae_model_type in ['vqvae', 'soft_vqvae']:
         print("🔍 Detected VQ-VAE model, applying NaN fix...")
-        fix_success = fix_vqvae_nan_issue(model)
+        # Pass the actual sample observation shape to the fix function
+        fix_success = fix_vqvae_nan_issue(model, sample_obs.shape[1:])
 
         if not fix_success:
             print("❌ VQ-VAE fix failed, switching to regular autoencoder")
@@ -157,17 +169,16 @@ def train_encoder(args):
             model, trainer = construct_ae_model(sample_obs.shape[1:], args, load=False)
 
         # Use very conservative hyperparameters for VQ-VAE
-        if args.ae_model_type in ['vqvae', 'soft_vqvae'] and trainer is not None:
+        elif args.ae_model_type in ['vqvae', 'soft_vqvae'] and trainer is not None:
             # Override learning rate to be very small
             for param_group in trainer.optimizer.param_groups:
                 old_lr = param_group['lr']
-                param_group['lr'] = min(old_lr, 1e-6)
+                param_group['lr'] = min(old_lr, 1e-4)  # Less aggressive than before
                 print(f"🔧 Reduced VQ-VAE learning rate from {old_lr} to {param_group['lr']}")
 
             # Set gradient clipping
-            trainer.grad_clip = max(trainer.grad_clip, 0.1)
+            trainer.grad_clip = max(trainer.grad_clip, 0.5)  # Less aggressive clipping
             print(f"🔧 Set VQ-VAE gradient clipping to {trainer.grad_clip}")
-    # *** END OF ADDITION ***
 
     # Apply basic GPU optimizations (without torch.compile)
     model = setup_efficient_model(model, args)
@@ -294,6 +305,7 @@ def train_encoder(args):
         print('Encoder model saved')
 
     return model  # Return the original model, not the compiled one
+
 
 
 def optimized_train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
@@ -449,7 +461,6 @@ def trainer_train_mixed_precision(trainer, batch_data, accumulation_steps):
         trainer.optimizer.zero_grad()
 
     return loss, aux_data
-
 
 def test_model_optimized(model, test_func, data_loader, device):
     """Optimized model testing with batched processing"""
