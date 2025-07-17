@@ -112,12 +112,12 @@ class DebugModelGUI:
 
         batch_size = test_latent.shape[0]
 
-        # Different action tensor formats to try
+        # FIXED: Try 2D formats first since discrete models expect 2D actions
         action_formats = [
-            ("batch_repeated", lambda a: torch.tensor([a] * batch_size, dtype=torch.long).to(self.args.device)),
-            ("single_action", lambda a: torch.tensor([a], dtype=torch.long).to(self.args.device)),
             ("batch_2d", lambda a: torch.tensor([[a]] * batch_size, dtype=torch.long).to(self.args.device)),
             ("single_2d", lambda a: torch.tensor([[a]], dtype=torch.long).to(self.args.device)),
+            ("batch_repeated", lambda a: torch.tensor([a] * batch_size, dtype=torch.long).to(self.args.device)),
+            ("single_action", lambda a: torch.tensor([a], dtype=torch.long).to(self.args.device)),
         ]
 
         self.log_debug("🔍 Finding working action format...")
@@ -136,7 +136,7 @@ class DebugModelGUI:
 
             except RuntimeError as e:
                 if "same number of dimensions" in str(e) or "Sizes of tensors must match" in str(e):
-                    self.log_debug(f"  ❌ {format_name} failed: dimension mismatch")
+                    self.log_debug(f"  ⚠️ {format_name} failed: dimension mismatch")
                     continue
                 else:
                     self.log_debug(f"  ❌ {format_name} failed: {e}")
