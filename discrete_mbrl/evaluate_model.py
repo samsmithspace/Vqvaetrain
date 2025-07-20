@@ -787,16 +787,17 @@ def eval_model(args, encoder_model=None, trans_model=None):
 
         log_videos({f'{args.eval_unroll_steps}-step_transition_sample': [img]}, args)
 
-        # img = img.permute(1, 2, 0).clip(0, 1).numpy()
-        # grayscale = img.shape[2] == 2 or img.shape[2] > 3
-        # if grayscale:
-        #   img = img[:, :, -1]
+        img = np.transpose(img, (1, 2, 0)).clip(0, 1)
 
-        # plt.imshow(img)
-        # if args.save:
-        #   plt.savefig(os.path.join(results_dir,
-        #     f'{args.trans_model_type}_trans_model_v{args.trans_model_version}' + \
-        #     f'_{args.eval_unroll_steps}-step_sample_{i}.png'))
+        grayscale = img.shape[2] == 2 or img.shape[2] > 3
+        if grayscale:
+          img = img[:, :, -1]
+
+        plt.imshow(img)
+        if args.save:
+          plt.savefig(os.path.join(results_dir,
+            f'{args.trans_model_type}_trans_model_v{args.trans_model_version}' + \
+            f'_{args.eval_unroll_steps}-step_sample_{i}.png'))
 
         # wandb_log({f'{args.eval_unroll_steps}-step_transition_sample': img}, args.wandb)
 
