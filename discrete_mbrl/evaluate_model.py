@@ -1,17 +1,15 @@
 import gc
+import psutil
 import os
 import sys
 import time
 
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
-import gymnasium as gym
-from gymnasium.core import Wrapper
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 import seaborn as sns
-import torch
-import torch.nn.functional as F
 from stable_baselines3.common.vec_env import DummyVecEnv
 from tqdm import tqdm
 
@@ -29,488 +27,786 @@ sns.set()
 
 GAMMA_CONST = 0.99
 N_EXAMPLE_IMGS = 15
-SEED = 0
-N_RAND_LATENT_SAMPLES = 500
+SEED = 0  # Should be same as seed used for prior steps
+PRELOAD_TEST = False
+TEST_WORKERS = 0
+EARLY_STOP_COUNT = 3000
 DISCRETE_TRANS_TYPES = ('discrete', 'transformer', 'transformerdec')
 CONTINUOUS_TRANS_TYPES = ('continuous', 'shared_vq')
-
-
-def safe_tensor_to_device(data, device):
-    """Safely move tensor to device with proper shape handling"""
-    if isinstance(data, (list, tuple)):
-        return [safe_tensor_to_device(x, device) for x in data]
-    elif torch.is_tensor(data):
-        return data.to(device, non_blocking=True)
-    return data
-
-
-def fix_tensor_shapes_for_discrete(obs, actions, next_obs, rewards, dones, extra_data=None):
-    """Fix tensor shapes specifically for discrete transition models - COMPREHENSIVE FIX"""
-    extra_data = extra_data or []
-
-    # Handle multi-step data by flattening
-    if len(obs.shape) == 5:  # [batch, n_steps, channels, height, width]
-        batch_size, n_steps = obs.shape[:2]
-        obs = obs.reshape(batch_size * n_steps, *obs.shape[2:])
-        next_obs = next_obs.reshape(batch_size * n_steps, *next_obs.shape[2:])
-
-        # Handle actions - ensure proper shape for discrete models
-        if len(actions.shape) == 2:  # [batch, n_steps]
-            actions = actions.reshape(batch_size * n_steps)
-        elif len(actions.shape) == 3:  # [batch, n_steps, action_dim]
-            actions = actions.reshape(batch_size * n_steps, *actions.shape[2:])
-
-        # Handle rewards and dones - ensure they're 1D
-        if len(rewards.shape) == 2:  # [batch, n_steps]
-            rewards = rewards.reshape(batch_size * n_steps)
-        elif len(rewards.shape) > 2:
-            rewards = rewards.reshape(batch_size * n_steps, *rewards.shape[2:])
-
-        if len(dones.shape) == 2:  # [batch, n_steps]
-            dones = dones.reshape(batch_size * n_steps)
-        elif len(dones.shape) > 2:
-            dones = dones.reshape(batch_size * n_steps, *dones.shape[2:])
-
-        extra_data = [x.reshape(batch_size * n_steps, *x.shape[2:]) for x in extra_data]
-
-    # COMPREHENSIVE ACTION SHAPE FIX
-    # Ensure actions are exactly [batch_size, 1] for discrete models
-    if len(actions.shape) == 1:
-        actions = actions.unsqueeze(-1)  # [batch_size] -> [batch_size, 1]
-    elif len(actions.shape) == 2 and actions.shape[1] != 1:
-        if actions.shape[1] == actions.shape[0]:  # Square matrix - likely wrong format
-            actions = actions.diag().unsqueeze(-1)  # Take diagonal and reshape
-        else:
-            actions = actions[:, :1]  # Take first column only
-    elif len(actions.shape) > 2:
-        actions = actions.reshape(actions.shape[0], -1)[:, :1]  # Flatten and take first column
-
-    # COMPREHENSIVE REWARD/DONE SHAPE FIX
-    # Ensure rewards and dones are exactly [batch_size]
-    if len(rewards.shape) == 0:  # Scalar
-        rewards = rewards.unsqueeze(0)
-    elif len(rewards.shape) == 2:
-        if rewards.shape[1] == 1:
-            rewards = rewards.squeeze(-1)  # [batch_size, 1] -> [batch_size]
-        else:
-            rewards = rewards.mean(dim=1)  # Average if multiple values
-    elif len(rewards.shape) > 2:
-        rewards = rewards.reshape(rewards.shape[0], -1).mean(dim=1)
-
-    if len(dones.shape) == 0:  # Scalar
-        dones = dones.unsqueeze(0)
-    elif len(dones.shape) == 2:
-        if dones.shape[1] == 1:
-            dones = dones.squeeze(-1)  # [batch_size, 1] -> [batch_size]
-        else:
-            dones = dones.float().mean(dim=1)  # Average if multiple values
-    elif len(dones.shape) > 2:
-        dones = dones.reshape(dones.shape[0], -1).float().mean(dim=1)
-
-    # Convert dones to float for loss calculation
-    dones = dones.float()
-
-    return obs, actions, next_obs, rewards, dones, extra_data
-
-
-def evaluate_encoder_reconstruction(encoder_model, test_loader, args):
-    """Evaluate encoder reconstruction quality"""
-    n_samples = 0
-    encoder_recon_loss = 0.0
-    all_latents = []
-
-    print('Evaluating encoder reconstruction...')
-    device = next(encoder_model.parameters()).device
-
-    with torch.no_grad():
-        for batch_data in test_loader:
-            obs_data = batch_data[0].to(device)
-            n_samples += obs_data.shape[0]
-
-            # Encode and decode
-            latents = encoder_model.encode(obs_data)
-            recon_outputs = encoder_model.decode(latents)
-            all_latents.append(latents.cpu())
-
-            # Calculate reconstruction loss
-            if recon_outputs.shape == obs_data.shape:
-                encoder_recon_loss += F.mse_loss(recon_outputs, obs_data, reduction='sum').item()
-
-    all_latents = torch.cat(all_latents, dim=0)
-    encoder_recon_loss = encoder_recon_loss / n_samples
-
-    print(f'Encoder reconstruction loss: {encoder_recon_loss:.2f}')
-    log_metrics({'encoder_recon_loss': encoder_recon_loss}, args)
-
-    return all_latents, encoder_recon_loss
-
-
-def evaluate_random_latent_sampling(encoder_model, all_latents, args, unique_obs, rev_transform):
-    """Evaluate decoder by sampling random latent vectors"""
-    print('Sampling random latent vectors...')
-
-    # Skip for identity encoders
-    if hasattr(encoder_model, '__class__') and 'Identity' in encoder_model.__class__.__name__:
-        print('Identity encoder detected - skipping random latent sampling')
-        return
-
-    device = next(encoder_model.parameters()).device
-
-    if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
-        # Continuous latent space
-        latent_dim = encoder_model.latent_dim
-        all_latents = all_latents.reshape(all_latents.shape[0], latent_dim)
-
-        # Sample from learned distribution
-        latent_means = all_latents.mean(dim=0)
-        latent_stds = all_latents.std(dim=0)
-        sampled_latents = torch.normal(
-            latent_means.repeat(N_RAND_LATENT_SAMPLES),
-            latent_stds.repeat(N_RAND_LATENT_SAMPLES)
-        ).reshape(N_RAND_LATENT_SAMPLES, latent_dim)
-
-    elif args.trans_model_type in DISCRETE_TRANS_TYPES:
-        # Discrete latent space
-        batch_size = N_RAND_LATENT_SAMPLES
-        n_positions = encoder_model.n_latent_embeds
-        sampled_latents = torch.randint(
-            0, encoder_model.n_embeddings, (batch_size, n_positions), dtype=torch.long
-        )
-
-    # Generate images from sampled latents
-    with torch.no_grad():
-        obs = encoder_model.decode(sampled_latents.to(device))
-
-    if args.exact_comp and unique_obs is not None:
-        min_dists = get_min_mses(obs.cpu(), unique_obs)
-        print(f'Sample latent obs L2: {min_dists.mean():.4f}')
-        log_metrics({'sample_latent_obs_l2': min_dists.mean()}, args)
-
-    # Log sample images
-    imgs = obs_to_img(obs[:N_EXAMPLE_IMGS].cpu(), env_name=args.env_name, rev_transform=rev_transform)
-    log_images({'sample_latent_imgs': imgs}, args)
-
-
-def evaluate_transition_model_step(batch_data, encoder_model, trans_model, args):
-    """Evaluate a single step of the transition model with ROBUST shape handling"""
-    device = next(trans_model.parameters()).device
-
-    # Move data to device
-    batch_data = safe_tensor_to_device(batch_data, device)
-    obs, actions, next_obs, rewards, dones = batch_data[:5]
-    extra_data = batch_data[5:] if len(batch_data) > 5 else []
-
-    # Debug original shapes
-    print(f"🔍 Original shapes:")
-    print(f"  obs: {obs.shape}, actions: {actions.shape}, next_obs: {next_obs.shape}")
-    print(f"  rewards: {rewards.shape}, dones: {dones.shape}")
-
-    # Fix shapes for discrete models
-    obs, actions, next_obs, rewards, dones, extra_data = fix_tensor_shapes_for_discrete(
-        obs, actions, next_obs, rewards, dones, extra_data
-    )
-
-    # Debug fixed shapes
-    print(f"🔍 Fixed shapes:")
-    print(f"  obs: {obs.shape}, actions: {actions.shape}, next_obs: {next_obs.shape}")
-    print(f"  rewards: {rewards.shape}, dones: {dones.shape}")
-
-    try:
-        # Encode current and next observations
-        current_z = encoder_model.encode(obs)
-        next_z = encoder_model.encode(next_obs)
-
-        print(f"🔍 Encoded shapes:")
-        print(f"  current_z: {current_z.shape}, next_z: {next_z.shape}")
-
-        # Handle discrete vs continuous models differently
-        if args.trans_model_type in ['discrete', 'shared_vq', 'universal_vq']:
-            # For discrete models, ensure proper shape handling
-            if len(current_z.shape) > 2:
-                # Spatial output - flatten spatial dimensions
-                batch_size = current_z.shape[0]
-                current_z = current_z.view(batch_size, -1)
-                next_z = next_z.view(batch_size, -1)
-
-            # Ensure indices are long type
-            if current_z.dtype != torch.long:
-                current_z = current_z.long()
-                next_z = next_z.long()
-
-            # For discrete transition models, prepare input format
-            if hasattr(trans_model, 'forward'):
-                # Direct forward pass
-                next_z_pred_logits, next_reward_pred, next_gamma_pred = trans_model(
-                    current_z, actions, return_logits=True)
-            else:
-                # Fallback with one-hot encoding
-                z_logits = F.one_hot(current_z, encoder_model.n_embeddings).float()
-                z_logits = z_logits.permute(0, 2, 1)
-                next_z_pred_logits, next_reward_pred, next_gamma_pred = trans_model(
-                    z_logits, actions, return_logits=True)
-
-            # Convert predictions back to indices
-            if hasattr(trans_model, 'logits_to_state'):
-                next_z_pred = trans_model.logits_to_state(next_z_pred_logits)
-            else:
-                next_z_pred = torch.argmax(next_z_pred_logits, dim=1)
-
-            # Calculate losses with proper shape handling
-            if next_z_pred_logits.dim() == 3:  # [batch, n_embeddings, n_positions]
-                batch_size, n_embeddings, n_positions = next_z_pred_logits.shape
-                next_z_pred_logits_flat = next_z_pred_logits.permute(0, 2, 1).reshape(-1, n_embeddings)
-                next_z_flat = next_z.reshape(-1)
-
-                state_losses = F.cross_entropy(next_z_pred_logits_flat, next_z_flat, reduction='none')
-                state_losses = state_losses.view(batch_size, n_positions).sum(1)
-                state_accs = (next_z_pred == next_z).float().mean(1)
-            else:
-                state_losses = F.cross_entropy(next_z_pred_logits, next_z, reduction='none')
-                state_accs = (next_z_pred == next_z).float()
-                if state_accs.dim() > 1:
-                    state_accs = state_accs.mean(1)
-
-        else:
-            # Continuous models
-            if hasattr(encoder_model, 'latent_dim'):
-                latent_dim = encoder_model.latent_dim
-                current_z = current_z.reshape(current_z.shape[0], latent_dim)
-                next_z = next_z.reshape(next_z.shape[0], latent_dim)
-            else:
-                current_z = current_z.reshape(current_z.shape[0], -1)
-                next_z = next_z.reshape(next_z.shape[0], -1)
-
-            # Predict next state
-            next_z_pred, next_reward_pred, next_gamma_pred = trans_model(current_z, actions)
-
-            # Calculate losses
-            state_losses = F.mse_loss(next_z_pred, next_z, reduction='none').sum(1)
-            state_accs = torch.zeros_like(state_losses)
-
-        # ROBUST reward and gamma loss calculation
-        # Ensure predictions are 1D to match target shapes
-        if next_reward_pred.dim() > 1:
-            next_reward_pred = next_reward_pred.squeeze(-1)
-        if next_gamma_pred.dim() > 1:
-            next_gamma_pred = next_gamma_pred.squeeze(-1)
-
-        # Ensure targets are 1D
-        if rewards.dim() > 1:
-            rewards = rewards.squeeze(-1)
-        if dones.dim() > 1:
-            dones = dones.squeeze(-1)
-
-        # Calculate gamma targets
-        gamma = (1 - dones.float()) * 0.99  # GAMMA_CONST = 0.99
-
-        # Calculate losses with shape verification
-        print(f"🔍 Loss calculation shapes:")
-        print(f"  next_reward_pred: {next_reward_pred.shape}, rewards: {rewards.shape}")
-        print(f"  next_gamma_pred: {next_gamma_pred.shape}, gamma: {gamma.shape}")
-
-        reward_losses = F.mse_loss(next_reward_pred, rewards, reduction='none')
-        gamma_losses = F.mse_loss(next_gamma_pred, gamma, reduction='none')
-
-        # Image reconstruction loss
-        try:
-            if args.trans_model_type in ['discrete', 'shared_vq', 'universal_vq']:
-                decoded_next_obs = encoder_model.decode(next_z_pred)
-            else:
-                decoded_next_obs = encoder_model.decode(next_z_pred)
-
-            img_mse_losses = F.mse_loss(decoded_next_obs, next_obs, reduction='none')
-            img_mse_losses = img_mse_losses.view(next_obs.shape[0], -1).sum(1)
-        except Exception as e:
-            print(f"Warning: Image reconstruction failed: {e}")
-            img_mse_losses = torch.zeros(next_obs.shape[0], device=device)
-
-        loss_dict = {
-            'state_loss': state_losses.cpu().numpy(),
-            'state_acc': state_accs.cpu().numpy(),
-            'reward_loss': reward_losses.cpu().numpy(),
-            'gamma_loss': gamma_losses.cpu().numpy(),
-            'img_mse_loss': img_mse_losses.cpu().numpy(),
-        }
-
-        return loss_dict
-
-    except Exception as e:
-        print(f"❌ Error in transition model evaluation: {e}")
-        print(f"Shapes - obs: {obs.shape}, actions: {actions.shape}, next_obs: {next_obs.shape}")
-        print(f"Shapes - rewards: {rewards.shape}, dones: {dones.shape}")
-
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def evaluate_transition_model(encoder_model, trans_model, args, unique_obs=None):
-    """Evaluate transition model accuracy"""
-    print('Evaluating transition model...')
-
-    # Load n-step data
-    n_step_loader = prepare_dataloader(
-        args.env_name, 'test', batch_size=args.batch_size, preprocess=args.preprocess,
-        randomize=True, n=args.max_transitions, n_preload=0, preload=False,
-        n_step=args.eval_unroll_steps, extra_buffer_keys=args.extra_buffer_keys
-    )
-
-    all_losses = []
-    n_processed = 0
-
-    print('Calculating stats for n-step data...')
-    for batch_data in tqdm(n_step_loader):
-        if n_processed >= 10000:  # Limit for faster evaluation
-            break
-
-        loss_dict = evaluate_transition_model_step(batch_data, encoder_model, trans_model, args)
-
-        if loss_dict is not None:
-            all_losses.append(loss_dict)
-            n_processed += batch_data[0].shape[0]
-
-    if all_losses:
-        # Calculate mean losses
-        mean_losses = {}
-        for key in all_losses[0].keys():
-            values = np.concatenate([loss[key] for loss in all_losses])
-            mean_losses[key] = np.mean(values)
-
-        print(f'Transition model losses: {mean_losses}')
-        log_metrics(mean_losses, args)
+N_RAND_LATENT_SAMPLES = 500
+STATE_DISTRIB_SAMPLES = 20000  # 20000
+IMAGINE_DISTRIB_SAMPLES = 2000  # 2000
+UNIQUE_OBS_EARLY_STOP = 1.0  # 0.2s
+
+
+def calculate_trans_losses(
+        next_z, next_reward, next_gamma, next_z_pred_logits, next_z_pred, next_reward_pred,
+        next_gamma_pred, next_obs, trans_model_type, encoder_model, rand_obs=None,
+        init_obs=None, all_obs=None, all_trans=None, curr_z=None, acts=None):
+    # Calculate the transition reconstruction loss
+    loss_dict = {}
+    if trans_model_type in CONTINUOUS_TRANS_TYPES:
+        assert next_z.shape == next_z_pred_logits.shape
+        state_losses = torch.pow(next_z - next_z_pred_logits, 2)
+        state_losses = state_losses.view(next_z.shape[0], -1).sum(1)
+        loss_dict['state_loss'] = state_losses.cpu().numpy()
+        loss_dict['state_acc'] = np.array([0] * next_z.shape[0])
+    elif trans_model_type in DISCRETE_TRANS_TYPES:
+        state_losses = F.cross_entropy(
+            next_z_pred_logits, next_z, reduction='none')
+        state_losses = state_losses.view(next_z.shape[0], -1).sum(1)
+        state_accs = (next_z_pred == next_z).float().view(next_z.shape[0], -1).mean(1)
+        loss_dict['state_loss'] = state_losses.cpu().numpy()
+        loss_dict['state_acc'] = state_accs.cpu().numpy()
+
+    # Calculate the transition image reconstruction loss
+    next_obs_pred = encoder_model.decode(next_z_pred).cpu()
+    img_mse_losses = torch.pow(next_obs - next_obs_pred, 2)
+    loss_dict['img_mse_loss'] = img_mse_losses.view(next_obs.shape[0], -1).sum(1).numpy()
+    loss_dict['reward_loss'] = F.mse_loss(next_reward,
+                                          next_reward_pred.squeeze().cpu(), reduction='none').numpy()
+    loss_dict['gamma_loss'] = F.mse_loss(next_gamma,
+                                         next_gamma_pred.squeeze().cpu(), reduction='none').numpy()
+
+    if rand_obs is not None:
+        rand_img_mse_losses = torch.pow(next_obs - rand_obs, 2)
+        loss_dict['rand_img_mse_loss'] = rand_img_mse_losses.view(
+            next_obs.shape[0], -1).sum(1).numpy()
     else:
-        print('No valid transition model results')
+        loss_dict['rand_img_mse_loss'] = np.array([np.nan] * next_obs.shape[0])
+
+    if init_obs is not None:
+        init_img_mse_losses = torch.pow(next_obs - init_obs, 2)
+        loss_dict['init_img_mse_loss'] = init_img_mse_losses.view(
+            next_obs.shape[0], -1).sum(1).numpy()
+    else:
+        loss_dict['init_img_mse_loss'] = np.array([np.nan] * next_obs.shape[0])
+
+    if all_obs is not None:
+        no_dists, no_idxs = get_min_mses(next_obs_pred, all_obs, return_idxs=True)
+        loss_dict['closest_img_mse_loss'] = no_dists
+
+        if all_trans is not None and curr_z is not None:
+            curr_obs_pred = encoder_model.decode(curr_z).cpu()
+            o_dists, o_idxs = get_min_mses(curr_obs_pred, all_obs, return_idxs=True)
+            start_obs = to_hashable_tensor_list(all_obs[o_idxs])
+            end_obs = to_hashable_tensor_list(all_obs[no_idxs])
+            acts = acts.cpu().tolist()
+
+            trans_exists = []
+            for so, eo, a in zip(start_obs, end_obs, acts):
+                if all_trans[so][(a, eo)] == 0:
+                    trans_exists.append(0)
+                else:
+                    trans_exists.append(1)
+
+            loss_dict['real_transition_frac'] = np.array(trans_exists)
+        else:
+            loss_dict['real_transition_frac'] = np.array([np.nan] * next_obs.shape[0])
+    else:
+        loss_dict['closest_img_mse_loss'] = np.array([np.nan] * next_obs.shape[0])
+        loss_dict['real_transition_frac'] = np.array([np.nan] * next_obs.shape[0])
+
+    return loss_dict
+
+
+def wandb_log(items, do_log, make_gif=False):
+    if do_log:
+        for k, v in items.items():
+            if isinstance(v, list) and isinstance(v[0], np.ndarray) \
+                    and len(v[0].shape) > 1:
+                items[k] = [wandb.Image(x) for x in v]
+            elif isinstance(v, np.ndarray) and len(v.shape) > 1:
+                if make_gif:
+                    items[k] = wandb.Video(v, fps=4, format='gif')
+                else:
+                    items[k] = wandb.Image(v)
+            elif isinstance(v, Figure):
+                items[k] = wandb.Image(v)
+        wandb.log(items)
+
+
+def save_and_log_imgs(imgs, label, results_dir, args):
+    # if args.save:
+    #   plt.savefig(os.path.join(results_dir,
+    #     f'{args.ae_model_type}_v{args.ae_model_version}_{label}.png'))
+    wandb_log({label: [img.clip(0, 1) for img in imgs]}, args.wandb)
 
 
 def get_min_mses(gens, sources, return_idxs=False):
-    """Get minimum MSE between generated samples and source samples"""
+    """ Get the minimum distance between each generated sample and all sources. """
     if len(gens.shape) == len(sources.shape) - 1:
-        gens = gens.unsqueeze(0)
+        gens = gens[None]
+    assert gens.shape[1:] == sources.shape[1:], \
+        f'gens.shape: {gens.shape}, sources.shape: {sources.shape}, but core dims need to be equal!'
 
     min_dists = []
     min_idxs = []
-
     for gen in gens:
-        dists = ((gen.unsqueeze(0) - sources) ** 2).view(sources.shape[0], -1).sum(dim=1)
+        dists = (gen.unsqueeze(0) - sources) ** 2
+        dists = dists.reshape(dists.shape[0], -1).sum(dim=1)
         min_dist = dists.min().item()
         min_dists.append(min_dist)
-
         if return_idxs:
             min_idx = dists.argmin().item()
             min_idxs.append(min_idx)
-
     if return_idxs:
         return np.array(min_dists), np.array(min_idxs)
     return np.array(min_dists)
 
 
-def generate_sample_images(encoder_model, test_loader, args):
-    """Generate sample reconstruction images"""
-    print('Generating reconstruction sample images...')
-
-    device = next(encoder_model.parameters()).device
-    sample_data = next(iter(test_loader))[0][:N_EXAMPLE_IMGS].to(device)
-
-    with torch.no_grad():
-        if hasattr(encoder_model, 'forward') and callable(encoder_model.forward):
-            try:
-                recon_obs = encoder_model(sample_data)
-                if isinstance(recon_obs, tuple):
-                    recon_obs = recon_obs[0]
-            except:
-                # Fallback to encode/decode
-                encoded = encoder_model.encode(sample_data)
-                recon_obs = encoder_model.decode(encoded)
-        else:
-            encoded = encoder_model.encode(sample_data)
-            recon_obs = encoder_model.decode(encoded)
-
-    # Create comparison images
-    comparison = torch.cat([sample_data.cpu(), recon_obs.cpu()], dim=3)
-    imgs = obs_to_img(comparison, env_name=args.env_name)
-    log_images({'recon_sample_imgs': imgs}, args)
+def update_losses(losses, new_losses, args, step, log=True):
+    for k, v in new_losses.items():
+        losses[k].extend(v)
+    n_losses = len(new_losses[k])
+    losses['model'].extend([f'{args.trans_model_type}' \
+                            + f'_v{args.trans_model_version}' for _ in range(n_losses)])
+    losses['step'].extend([step for _ in range(n_losses)])
 
 
 def eval_model(args, encoder_model=None, trans_model=None):
-    """Main evaluation function - simplified and fixed"""
     import_logger(args)
-    torch.manual_seed(SEED)
 
-    # Setup
-    unique_obs = None
+    # Randomize pytorch seed
+    # Doing this because I was getting unintentially deterministic behavior
+    torch.manual_seed(time.time())
+
+    # Collect a set of all unique observations in the environment
+    # Not recommended for complex environments
     if args.exact_comp:
-        try:
-            unique_obs, unique_data_hash = get_unique_obs(
-                args, cache=True, partition='all', return_hash=True, early_stop_frac=0.2
-            )
-            log_metrics({'unique_obs_count': len(unique_obs)}, args)
-        except Exception as e:
-            print(f"Warning: Could not load unique observations: {e}")
-            args.exact_comp = False
+        unique_obs, unique_data_hash = get_unique_obs(
+            args, cache=True, partition='all', return_hash=True,
+            early_stop_frac=UNIQUE_OBS_EARLY_STOP)
 
-    # Load test data
+        log_metrics({'unique_obs_count': len(unique_obs)}, args)
+    else:
+        unique_obs = None
+    trans_dict = None  # Currently not used
+
+    env = make_env(args.env_name, max_steps=args.env_max_steps)
+
+    ### Loading Models & Some Data ###
+
     print('Loading data...')
     test_loader = prepare_dataloader(
         args.env_name, 'test', batch_size=args.batch_size, preprocess=args.preprocess,
-        randomize=False, n=args.max_transitions, n_preload=0, preload=False,
-        extra_buffer_keys=args.extra_buffer_keys
-    )
+        randomize=False, n=args.max_transitions, n_preload=TEST_WORKERS, preload=args.preload_data,
+        extra_buffer_keys=args.extra_buffer_keys)
+    test_sampler = create_fast_loader(
+        test_loader.dataset, batch_size=1, shuffle=True, num_workers=TEST_WORKERS, n_step=1)
+    rev_transform = test_loader.dataset.flat_rev_obs_transform
 
-    # Load models if not provided
-    if encoder_model is None or trans_model is None:
-        print('Loading models...')
-        sample_obs = next(iter(test_loader))[0]
-
-        if encoder_model is None:
-            encoder_model = construct_ae_model(sample_obs.shape[1:], args)[0]
-            encoder_model = encoder_model.to(args.device)
-
-        if trans_model is None:
-            env = make_env(args.env_name, max_steps=args.env_max_steps)
-            trans_model = construct_trans_model(encoder_model, args, env.action_space)[0]
-            trans_model = trans_model.to(args.device)
-            env.close()
-
-    # Ensure models are in eval mode
-    encoder_model.eval()
-    trans_model.eval()
+    # Load the encoder
+    if encoder_model is None:
+        sample_obs = next(iter(test_sampler))[0]
+        encoder_model = construct_ae_model(
+            sample_obs.shape[1:], args)[0]
+    encoder_model = encoder_model.to(args.device)
     freeze_model(encoder_model)
+    encoder_model.eval()
+    print(f'Loaded encoder')
+
+    if hasattr(encoder_model, 'enable_sparsity'):
+        encoder_model.enable_sparsity()
+
+    # Load the transition model
+    if trans_model is None:
+        trans_model = construct_trans_model(encoder_model, args, env.action_space)[0]
+    trans_model = trans_model.to(args.device)
     freeze_model(trans_model)
+    trans_model.eval()
+    print(f'Loaded transition model')
 
-    # Evaluation pipeline
-    try:
-        # 1. Encoder reconstruction
-        all_latents, encoder_recon_loss = evaluate_encoder_reconstruction(encoder_model, test_loader, args)
+    # Hack for universal_vq to work with the current code
+    if args.trans_model_type == 'universal_vq':
+        if encoder_model.quantized_enc:
+            global CONTINUOUS_TRANS_TYPES
+            CONTINUOUS_TRANS_TYPES = CONTINUOUS_TRANS_TYPES + ('universal_vq',)
+        else:
+            global DISCRETE_TRANS_TYPES
+            DISCRETE_TRANS_TYPES = DISCRETE_TRANS_TYPES + ('universal_vq',)
 
-        # 2. Random latent sampling
-        evaluate_random_latent_sampling(encoder_model, all_latents, args, unique_obs, None)
+    ### Exact State Comparison ###
 
-        # 3. Sample reconstruction images
-        generate_sample_images(encoder_model, test_loader, args)
+    if args.exact_comp:
 
-        # 4. Transition model evaluation
-        evaluate_transition_model(encoder_model, trans_model, args, unique_obs)
+        ### Log the representations of each state ###
 
-        print('✅ Evaluation completed successfully!')
+        if args.log_state_reprs:
+            print('Logging state representations...')
+            # First sort unique obs based on hashes, then encode in batches
+            hashes = hash_tensors(unique_obs)
+            order = np.argsort(hashes)
+            ordered_obs = unique_obs[order]
 
-    except Exception as e:
-        print(f"❌ Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
+            state_reprs = []
+            for i in range(0, len(ordered_obs), args.eval_batch_size):
+                reprs = encoder_model.encode(
+                    ordered_obs[i:i + args.eval_batch_size].to(args.device))
+                if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
+                    reprs = reprs.reshape(reprs.shape[0], encoder_model.latent_dim)
+                state_reprs.extend(list(reprs.cpu().detach().numpy()))
+            state_reprs = np.stack(state_reprs)
 
-    finally:
-        # Cleanup
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            log_np_array(state_reprs, 'state_reprs', args)
+
+        ### Start getting state distributions ###
+
+        vec_env = DummyVecEnv([lambda: FreezeOnDoneWrapper(make_env(args.env_name, max_steps=args.env_max_steps)) \
+                               for _ in range(args.eval_batch_size)])
+
+        for eval_policy in args.eval_policies:
+            target_state_ids = [[] for _ in range(args.eval_unroll_steps)]
+            pred_state_ids = [[] for _ in range(args.eval_unroll_steps)]
+            n_unknown_states = 0
+            total_iter_states = 0
+
+            # First check for cached version of stated distribution
+            state_distr_hash = unique_data_hash + '_' + eval_policy + '_' + \
+                               str(args.eval_unroll_steps) + '_' + str(STATE_DISTRIB_SAMPLES)
+            state_distr_path = os.path.join(CACHE_DIR, f'{state_distr_hash}.pkl')
+            if os.path.exists(state_distr_path):
+                print(f'Loading cached state distribution data from {state_distr_path}...')
+                time_since_update = time.time() - os.path.getmtime(state_distr_path)
+                while time_since_update < 30:
+                    time.sleep(10)
+                    time_since_update = time.time() - os.path.getmtime(state_distr_path)
+                with open(state_distr_path, 'rb') as f:
+                    state_distribs = pickle.load(f)
+                print('Finished loading!')
+            else:
+                print(f'No cached state distribution data found, generating new data')
+                state_distribs = None
+
+            print('Simulating trajectories to calculate state visitation frequencies...')
+
+            policy = load_policy(args.env_name, eval_policy)
+            print(f'Loaded {eval_policy} policy', flush=True)
+            policy = policy.to(args.device)
+            print(f'Pushing policy to device', flush=True)
+            policy.eval()
+            print(f'Put policy in eval mode', flush=True)
+
+            ### First handle real trajectories ###
+
+            n_total_states = len(unique_obs)
+
+            print('Simulating runs for real state distribution...')
+            if state_distribs is None:
+                # Loop over a batch of trajectories
+                n_batches = int(np.ceil(STATE_DISTRIB_SAMPLES / args.eval_batch_size))
+                for batch_idx in tqdm(range(n_batches)):
+                    transitions = [[], [], []]
+                    obs = vec_env.reset()
+                    for _ in range(args.eval_unroll_steps):
+                        fobs = torch.from_numpy(obs).float().to(args.device)
+                        act = policy.act(fobs).cpu().tolist()
+                        next_obs, _, done, infos = vec_env.step(act)
+
+                        for i, e in enumerate([obs, act, next_obs]):
+                            transitions[i].append(e)
+                        obs = next_obs
+
+                    # Format trajectory data as tensors
+                    transitions[0] = torch.from_numpy(np.stack(transitions[0])).to(torch.float16).float()
+                    transitions[0] = transitions[0].transpose(0, 1)
+                    transitions[1] = torch.from_numpy(np.stack(transitions[1])).long()
+                    transitions[2] = torch.from_numpy(np.stack(transitions[2])).to(torch.float16).float()
+                    transitions[2] = transitions[2].transpose(0, 1)
+
+                    # Convert observations into state IDs
+                    target_obs = transitions[2]
+                    batch_target_dists, batch_target_idxs = get_min_mses(
+                        target_obs.reshape(-1, *target_obs.shape[2:]), unique_obs, return_idxs=True)
+                    batch_target_dists = batch_target_dists.reshape(target_obs.shape[:2])
+                    batch_target_idxs = batch_target_idxs.reshape(target_obs.shape[:2])
+
+                    for target_dists, target_idxs in zip(batch_target_dists, batch_target_idxs):
+                        for i, (dist, idx) in enumerate(zip(target_dists, target_idxs)):
+                            if dist < EPSILON:
+                                target_state_ids[i].append(idx)
+                            else:
+                                n_unknown_states += 1
+                        total_iter_states += len(target_idxs)
+
+                # Calculate real state visitation frequencies if not cached
+                state_distribs = []
+                for i in range(args.eval_unroll_steps):
+                    target_ids = torch.tensor(target_state_ids[i]).long()
+                    target_distrib = F.one_hot(target_ids, n_total_states).float().mean(dim=0)
+                    state_distribs.append(target_distrib)
+                with open(state_distr_path, 'wb') as f:
+                    pickle.dump(state_distribs, f)
+                print(f'Saved state distribution data to {state_distr_path}')
+
+            ### Next handle imagined trajectories ###
+
+            print('Simulating runs for imagined state distribution...')
+            n_batches = int(np.ceil(IMAGINE_DISTRIB_SAMPLES / args.eval_batch_size))
+            for batch_idx in tqdm(range(n_batches)):
+                pred_states = []
+                obs = vec_env.reset()
+                curr_states = encoder_model.encode(torch.from_numpy(obs) \
+                                                   .float().to(args.device))
+
+                # Predict all states from the starting state
+                frozen_idxs = -torch.ones((len(obs),), device=args.device)
+                for i in range(args.eval_unroll_steps):
+                    pred_obs = encoder_model.decode(curr_states)
+                    act = policy.act(pred_obs)
+                    curr_states, _, gamma = trans_model(curr_states, act)
+
+                    # TODO: Add gamma prediction to transformers and fix terminal predictions
+                    # Freeze states that are predicted to be terminal
+                    for j in range(len(frozen_idxs)):
+                        if frozen_idxs[j] != -1 and i > 0:
+                            curr_states[j] = pred_states[-1][j]
+
+                    if gamma is not None:
+                        done_envs = gamma.squeeze(1) < 0.5
+                        not_done_idxs = frozen_idxs == -1
+                        update_idxs = torch.logical_and(done_envs, not_done_idxs)
+                        frozen_idxs[update_idxs] = i
+
+                    pred_states.append(curr_states)
+
+                # (seq x batch) x obs
+                pred_states = torch.cat(pred_states)
+                pred_obs = encoder_model.decode(pred_states).cpu()
+                # (seq x batch)
+                pred_idxs = get_min_mses(pred_obs, unique_obs, return_idxs=True)[1]
+                pred_idxs = rearrange(
+                    pred_idxs, '(s b) -> s b',
+                    b=args.eval_batch_size, s=args.eval_unroll_steps)
+
+                for i in range(len(pred_idxs)):
+                    pred_state_ids[i].extend(pred_idxs[i])
+
+            if total_iter_states > 0:
+                frac_known_states = 1 - n_unknown_states / total_iter_states
+                print(f'Fraction of known states: {frac_known_states:.3f}')
+                log_metrics({f'{eval_policy}_frac_known_states': frac_known_states}, args)
+
+            uniform_distrib = torch.ones(n_total_states) / n_total_states
+
+            # Calculate sample KL-divergence at each step and log
+            print('Calculating state distributions...')
+            kl_divs = []
+            pred_distribs = []
+            for i in range(args.eval_unroll_steps):
+                pred_ids = torch.tensor(pred_state_ids[i]).long()
+                pred_distrib = F.one_hot(pred_ids, n_total_states).float().mean(dim=0)
+                pred_distribs.append(pred_distrib)
+
+                kl_div = (state_distribs[i] * (state_distribs[i] / \
+                                               (pred_distrib + EPSILON) + EPSILON).log()).sum().item()
+                kl_divs.append(kl_div)
+                first_state_kl_div = (state_distribs[i] * (state_distribs[i] / \
+                                                           (state_distribs[0] + EPSILON) + EPSILON).log()).sum().item()
+                delayed_state_kl_div = (state_distribs[i] * (state_distribs[i] / \
+                                                             (state_distribs[max(0,
+                                                                                 i - 1)] + EPSILON) + EPSILON).log()).sum().item()
+                uniform_kl_div = (state_distribs[i] * (state_distribs[i] / \
+                                                       uniform_distrib + EPSILON).log()).sum().item()
+
+                print('KL-divergence at step {}: {:.3f}'.format(i + 1, kl_div))
+                log_metrics({
+                    f'{eval_policy}_state_distrib_kl_div': kl_div,
+                    f'{eval_policy}_first_state_distrib_kl_div': first_state_kl_div,
+                    f'{eval_policy}_delayed_state_distrib_kl_div': delayed_state_kl_div,
+                    f'{eval_policy}_uniform_distrib_kl_div': uniform_kl_div,
+                    'n_step': i + 1}, args, step=i + 1)
+            log_metrics({f'{eval_policy}_state_distrib_kl_div_mean': np.mean(kl_divs)}, args)
+
+            del target_state_ids, pred_state_ids
+
+            ### Visualize the state distributions ###
+
+            # First calculate the background image
+
+            # I think this simplistic method only works because of the fact that
+            # we are working with a grid, may need to change in the future
+            background_obs = unique_obs.mode(dim=0).values
+            img_diffs = unique_obs - background_obs
+
+            distrib_imgs = []
+            for i, (state_distrib, pred_distrib) in enumerate(zip(state_distribs, pred_distribs)):
+                state_distrib_diffs = (state_distrib[:, None, None, None] \
+                                       * img_diffs).sum(dim=0).numpy()
+                pred_distrib_diffs = (pred_distrib[:, None, None, None] \
+                                      * img_diffs).sum(dim=0).numpy()
+                # Normalize so it's easier to see
+                norm_factor = 1 / state_distrib_diffs.max()
+                norm_state_diffs = state_distrib_diffs * norm_factor
+                state_distrib_obs = background_obs + norm_state_diffs
+                state_distib_img = state_distrib_obs.permute(1, 2, 0).numpy()
+
+                norm_factor = 1 / pred_distrib_diffs.max()
+                norm_pred_diffs = pred_distrib_diffs * norm_factor
+                pred_distrib_obs = background_obs + norm_pred_diffs
+                pred_distib_img = pred_distrib_obs.permute(1, 2, 0).numpy()
+
+                norm_error_diffs = norm_state_diffs - norm_pred_diffs
+                rev_norm_error_diffs = norm_pred_diffs - norm_state_diffs
+                red_channel = np.copy(rev_norm_error_diffs[0])
+                rev_norm_error_diffs[0] = rev_norm_error_diffs[1]
+                rev_norm_error_diffs[1] = rev_norm_error_diffs[2]
+                rev_norm_error_diffs[2] = red_channel
+                error_distrib_obs = background_obs + norm_error_diffs + rev_norm_error_diffs
+                error_distrib_img = error_distrib_obs.permute(1, 2, 0).numpy()
+
+                # Ground truth, prediction, difference
+                distrib_img = np.concatenate(
+                    [state_distib_img, pred_distib_img, error_distrib_img], axis=0)
+                distrib_imgs.append(distrib_img)
+            temporal_distrib_img = np.concatenate(distrib_imgs, axis=1)
+            temporal_distrib_img = temporal_distrib_img.clip(0, 1)
+            log_images({f'{eval_policy}_temporal_state_distrib': [temporal_distrib_img]}, args)
+
+            ### Visualize the state distributions with plots ###
+
+            # Order from most to least frequent in final ground truth distribution
+            state_order = state_distribs[-1].numpy().argsort()[::-1]
+
+            fig = plt.figure(figsize=(len(unique_obs) / 168 * 14, args.eval_unroll_steps))
+            axs = fig.subplots(args.eval_unroll_steps, 1)
+            plots = []
+            for i in range(args.eval_unroll_steps):
+                r1 = state_distribs[i].numpy()[state_order]
+                r2 = pred_distribs[i].numpy()[state_order]
+
+                p1 = sns.barplot(
+                    x=list(range(len(r1))), y=r1, color='red', alpha=0.5, ax=axs[i])
+                p2 = sns.barplot(
+                    x=list(range(len(r2))), y=r2, color='blue', alpha=0.5, ax=axs[i])
+                plots.extend([p1, p2])
+
+                axs[i].set_ylabel(f'{i + 1}')
+
+                axs[i].set_xticks([])
+                axs[i].set_yticks([])
+
+                axs[i].set_xlim([0, len(unique_obs)])
+
+            fig.text(0.5, 0.08, 'State Visitation Distribution', ha='center')
+            fig.text(0.08, 0.5, 'Step', va='center', rotation='vertical')
+            fig.suptitle('State Visitation Distributions', fontsize=16)
+            fig.tight_layout(rect=[0.1, 0.09, 1, 0.98])
+
+            legend = plots[0].legend(
+                [plots[0].patches[0], plots[1].patches[0]],
+                ['Ground Truth', 'Simulated'],
+                loc='upper right',
+                bbox_to_anchor=(0.9, 1),
+                ncol=2,
+                frameon=True)
+
+            legend.legendHandles[0].set_color('red')
+            legend.legendHandles[1].set_color('blue')
+
+            log_figures({f'{eval_policy}_state_distrib_plot': [fig]}, args)
+
+    ### End Exact State Comparison ###
+
+    results_dir = f'./results/{args.env_name}'
+    os.makedirs(results_dir, exist_ok=True)
+
+    torch.manual_seed(SEED)
+    gc.collect()
+    print('Memory usage:', psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3)
+
+    ### Encoder Testing ###
+
+    # Calculate autoencoder reconstruction loss
+    n_samples = 0
+    encoder_recon_loss = torch.tensor(0, dtype=torch.float64)
+    all_latents = []
+    for batch_data in test_loader:
+        obs_data = batch_data[0]
+        n_samples += obs_data.shape[0]
+        with torch.no_grad():
+            latents = encoder_model.encode(obs_data.to(args.device))
+            recon_outputs = encoder_model.decode(latents)
+            all_latents.append(latents.cpu())
+        encoder_recon_loss += torch.sum((recon_outputs.cpu() - obs_data) ** 2)
+    all_latents = torch.cat(all_latents, dim=0)
+    encoder_recon_loss = (encoder_recon_loss / n_samples).item()
+    print(f'Encoder reconstruction loss: {encoder_recon_loss:.2f}')
+    log_metrics({'encoder_recon_loss': encoder_recon_loss}, args)
+
+    gc.collect()
+    print('Memory usage:', psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3)
+
+    # # Calculate symmetic uncertainty of discrete latents
+    # if args.trans_model_type in DISCRETE_TRANS_TYPES:
+    #   # This takes a large amount of memory
+    #   sym_uncertainty = sample_symmetric_uncertainty(all_latents)
+    #   import psutil; print('a:', psutil.virtual_memory()[3]/1e9)
+    #   mean_su = triu_avg(sym_uncertainty) # Avg SU of each latent variable pair
+    #   import psutil; print('a:', psutil.virtual_memory()[3]/1e9)
+    #   print(f'Mean symmetrical uncertainty: {mean_su:.3f}')
+    #   log_metrics({'mean_symmetrical_uncertainty': mean_su}, args)
+    #   # # Create heatmap of SU for visualization
+    #   # if args.wandb:
+    #   #   x_labels = y_labels = list(range(sym_uncertainty.shape[0]))
+    #   #   wandb.log({'symmetrical_uncertainty': wandb.plots.HeatMap(
+    #   #     x_labels, y_labels, sym_uncertainty.cpu().numpy(), show_text=False
+    #   #   )})
+
+    # Sample random latent vectors eval
+    print('Sampling random latent vectors...')
+    if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
+        latent_dim = encoder_model.latent_dim
+        all_latents = all_latents.reshape(all_latents.shape[0], latent_dim)
+
+        latent_min = all_latents.min()
+        latent_max = all_latents.max()
+        latent_range = latent_max - latent_min
+        uniform_sampled_latents = torch.rand((N_RAND_LATENT_SAMPLES, latent_dim))
+        uniform_sampled_latents = uniform_sampled_latents * latent_range + latent_min
+
+        with torch.no_grad():
+            obs = encoder_model.decode(uniform_sampled_latents.to(args.device))
+        obs = obs.cpu()
+
+        if args.exact_comp:
+            min_dists = get_min_mses(obs, unique_obs)
+            print('uniform_min_l2:', min_dists.mean())
+            log_metrics({'uniform_cont_sample_latent_obs_l2': min_dists.mean()}, args)
+        imgs = obs_to_img(obs[:N_EXAMPLE_IMGS], env_name=args.env_name, rev_transform=rev_transform)
+        log_images({'uniform_cont_sample_latent_imgs': imgs}, args)
+
+        latent_means = all_latents.mean(dim=0)
+        print('latent_means (16):', latent_means.shape)
+        latent_stds = all_latents.std(dim=0)
+        normal_sampled_latents = torch.normal(
+            latent_means.repeat(N_RAND_LATENT_SAMPLES),
+            latent_stds.repeat(N_RAND_LATENT_SAMPLES))
+        normal_sampled_latents = normal_sampled_latents.reshape(N_RAND_LATENT_SAMPLES, latent_dim)
+        print(normal_sampled_latents.shape)
+        with torch.no_grad():
+            obs = encoder_model.decode(normal_sampled_latents.to(args.device))
+        obs = obs.cpu()
+        if args.exact_comp:
+            min_dists = get_min_mses(obs, unique_obs)
+            print('normal_min_l2:', min_dists.mean())
+            log_metrics({'normal_sample_latent_obs_l2': min_dists.mean()}, args)
+        imgs = obs_to_img(obs[:N_EXAMPLE_IMGS], env_name=args.env_name, rev_transform=rev_transform)
+        log_images({'normal_sample_latent_imgs': imgs}, args)
+
+    elif args.trans_model_type in DISCRETE_TRANS_TYPES:
+        latent_dim = encoder_model.n_latent_embeds
+        sampled_latents = torch.randint(
+            0, encoder_model.n_embeddings, (N_RAND_LATENT_SAMPLES, latent_dim,))
+        with torch.no_grad():
+            obs = encoder_model.decode(sampled_latents.to(args.device))
+        obs = obs.cpu()
+        if args.exact_comp:
+            min_dists = get_min_mses(obs, unique_obs)
+            print('uniform_min_l2:', min_dists.mean())
+            log_metrics({'uniform_disc_sample_latent_obs_l2': min_dists.mean()}, args)
+        imgs = obs_to_img(obs[:N_EXAMPLE_IMGS], env_name=args.env_name, rev_transform=rev_transform)
+        log_images({'uniform_disc_sample_latent_imgs': imgs}, args)
+
+    # Generate reconstruction sample images
+    print('Generating reconstruction sample images...')
+    example_imgs = []
+    for i, sample_transition in enumerate(test_sampler):
+        sample_obs = sample_transition[0]
+        if i >= N_EXAMPLE_IMGS:
+            break
+        with torch.no_grad():
+            recon_obs = encoder_model(sample_obs.to(args.device))
+        if isinstance(recon_obs, tuple):
+            recon_obs = recon_obs[0]
+        both_obs = torch.cat([sample_obs, recon_obs.cpu()], dim=0)
+        both_imgs = obs_to_img(both_obs, env_name=args.env_name, rev_transform=rev_transform)
+        cat_img = np.concatenate([both_imgs[0], both_imgs[1]], axis=1)
+        example_imgs.append(cat_img)
+
+    recon_img_arr = np.concatenate(example_imgs, axis=1)
+    plt.figure(figsize=(N_EXAMPLE_IMGS * 2, N_EXAMPLE_IMGS))
+    plt.imshow(recon_img_arr.clip(0, 1))
+    log_images({'recon_sample_imgs': example_imgs}, args)
+
+    del test_loader, test_sampler
+
+    gc.collect()
+    print('Memory usage:', psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3)
+
+    ### Transition Model Testing ###
+
+    # test_workers = 0 if PRELOAD_TEST else int(args.n_preload/3)
+    n_step_loader = prepare_dataloader(
+        args.env_name, 'test', batch_size=args.batch_size, preprocess=args.preprocess,
+        randomize=True, n=args.max_transitions, n_preload=TEST_WORKERS, preload=args.preload_data,
+        n_step=args.eval_unroll_steps, extra_buffer_keys=args.extra_buffer_keys)
+    # alt_n_step_loader = create_fast_loader(
+    #   n_step_loader.dataset, batch_size=args.batch_size,
+    #   shuffle=True, num_workers=TEST_WORKERS, n_step=args.eval_unroll_steps)
+    n_step_sampler = create_fast_loader(
+        n_step_loader.dataset, batch_size=1, shuffle=True, num_workers=TEST_WORKERS,
+        n_step=args.eval_unroll_steps)
+
+    print(f'Sampled {args.eval_unroll_steps}-step sub-trajectories')
+
+    # Caculate n-step statistics
+    n_step_stats = dict(
+        state_loss=[], state_acc=[], reward_loss=[],
+        gamma_loss=[], img_mse_loss=[], rand_img_mse_loss=[],
+        init_img_mse_loss=[], step=[], model=[],
+        closest_img_mse_loss=[], real_transition_frac=[])
+
+    n_full_unroll_samples = 0
+    print('Calculating stats for n-step data...')
+    for i, n_step_trans in tqdm(enumerate(n_step_loader), total=len(n_step_loader)):
+        obs, acts, next_obs, rewards, dones = n_step_trans[:5]
+        # rand_obs = next(iter(alt_n_step_loader))[0][:obs.shape[0]]
+        # while rand_obs.shape[0] < obs.shape[0]:
+        #   rand_obs = next(iter(alt_n_step_loader))[0][:obs.shape[0]]
+        rand_obs = None
+        gammas = (1 - dones) * GAMMA_CONST
+        z = encoder_model.encode(obs[:, 0].to(args.device))
+        if args.trans_model_type in DISCRETE_TRANS_TYPES:
+            z_logits = F.one_hot(z, encoder_model.n_embeddings).permute(0, 2, 1).float() * 1e6
+        else:
+            z = z.reshape(z.shape[0], encoder_model.latent_dim)
+            z_logits = z
+
+        loss_dict = \
+            calculate_trans_losses(z, rewards[:, 0], gammas[:, 0], z_logits, z,
+                                   rewards[:, 0], gammas[:, 0], obs[:, 0], args.trans_model_type, encoder_model,
+                                   rand_obs=rand_obs[:, 0] if rand_obs else None, init_obs=obs[:, 0],
+                                   all_obs=unique_obs)
+        update_losses(n_step_stats, loss_dict, args, 0)
+
+        keep_idxs = set(range(obs.shape[0]))
+        for step in range(args.eval_unroll_steps):
+            next_z = encoder_model.encode(next_obs[:, step].to(args.device))
+            if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
+                next_z = next_z.reshape(next_z.shape[0], encoder_model.latent_dim)
+
+            next_z_pred_logits, next_reward_pred, next_gamma_pred = \
+                trans_model(z, acts[:, step].to(args.device), return_logits=True)
+            next_z_pred = trans_model.logits_to_state(next_z_pred_logits)
+            if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
+                next_z_pred_logits = next_z_pred_logits.reshape(
+                    next_z_pred_logits.shape[0], encoder_model.latent_dim)
+
+            loss_dict = calculate_trans_losses(
+                next_z, rewards[:, step], gammas[:, step],
+                next_z_pred_logits, next_z_pred, next_reward_pred, next_gamma_pred,
+                next_obs[:, step], args.trans_model_type, encoder_model,
+                rand_obs=rand_obs[:next_obs.shape[0], step] if rand_obs else None,
+                init_obs=obs[:, 0], all_obs=unique_obs, all_trans=trans_dict,
+                curr_z=z, acts=acts[:, step])
+            update_losses(n_step_stats, loss_dict, args, step + 1)
+
+            z = next_z_pred
+
+            # Remove transitions with finished episodes
+            keep_idxs = (dones[:, step] == 0).float().nonzero().squeeze()
+            if keep_idxs.numel() == 0:
+                break
+            obs, acts, next_obs, rewards, dones = \
+                [x[keep_idxs] for x in (obs, acts, next_obs, rewards, dones)]
+            gammas = gammas[keep_idxs]
+            z = z[keep_idxs]
+
+        n_full_unroll_samples += keep_idxs.numel()
+        print(f'{n_full_unroll_samples}/{EARLY_STOP_COUNT} full trajectories sampled')
+        if n_full_unroll_samples >= EARLY_STOP_COUNT:
+            break
+
+    # Upload the stats to logging server
+    print('Publishing n-step stats to cloud...')
+    for step in range(args.eval_unroll_steps + 1):
+        keep_idxs = [i for i, n_step in enumerate(n_step_stats['step']) \
+                     if n_step == step]
+        log_vars = {k: np.nanmean(np.array(v)[keep_idxs]) \
+                    for k, v in n_step_stats.items() \
+                    if k not in ('step', 'model')}
+        log_metrics({
+            'n_step': step,
+            **log_vars
+        }, args, step=step)
+
+    log_metrics({'img_mse_loss_mean': np.mean(n_step_stats['img_mse_loss'])}, args)
+
+    gc.collect()
+    print('Memory usage:', psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3)
+
+    # Create sample transition images
+    print('Creating sample transition images...')
+    samples = []
+    for i, sample_rollout in enumerate(n_step_sampler):
+        if len(samples) >= N_EXAMPLE_IMGS:
+            break
+        if sample_rollout[0].numel() > 0:
+            samples.append(sample_rollout)
+    sample_rollouts = [torch.stack([x[i] for x in samples]).squeeze(dim=1) \
+                       for i in range(len(samples[0]))]
+
+    all_obs = torch.cat((sample_rollouts[0][:, :1], sample_rollouts[2]), dim=1)
+    acts = sample_rollouts[1]
+    dones = sample_rollouts[4]
+    z = encoder_model.encode(all_obs[:, 0].to(args.device))
+    if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
+        z = z.reshape(z.shape[0], encoder_model.latent_dim)
+
+    # Convert hidden states to observations (if necessary)
+    all_obs = [states_to_imgs(o, args.env_name, transform=rev_transform) for o in all_obs]
+    all_obs = torch.from_numpy(np.stack(all_obs))
+
+    example_trans_imgs = []
+    example_trans_imgs.append(torch.cat((
+        all_obs[:, 0], torch.zeros_like(all_obs[:, 0])), dim=3))
+
+    continue_mask = torch.ones(all_obs.shape[0])
+    for step in range(args.eval_unroll_steps):
+        z = trans_model(z, acts[:, step].to(args.device))[0]
+        pred_obs = encoder_model.decode(z).cpu()
+
+        pred_obs = states_to_imgs(pred_obs, args.env_name, transform=rev_transform)
+        pred_obs = torch.from_numpy(pred_obs)
+
+        example_trans_imgs.append(torch.cat((
+            all_obs[:, step + 1], pred_obs), dim=3) \
+                                  * continue_mask[:, None, None, None])
+        continue_mask[dones[:, step].float().nonzero().squeeze()] = 0
+    example_trans_imgs = [
+        torch.stack([x[i] for x in example_trans_imgs])
+        for i in range(len(example_trans_imgs[0]))
+    ]
+
+    for i, img in enumerate(example_trans_imgs):
+        img = (img.clip(0, 1) * 255).numpy().astype(np.uint8)
+        grayscale = img.shape[1] == 2 or img.shape[1] > 3
+        if grayscale:
+            img = img[:, :-1, :, :]
+
+        log_videos({f'{args.eval_unroll_steps}-step_transition_sample': [img]}, args)
+
+        # img = img.permute(1, 2, 0).clip(0, 1).numpy()
+        # grayscale = img.shape[2] == 2 or img.shape[2] > 3
+        # if grayscale:
+        #   img = img[:, :, -1]
+
+        # plt.imshow(img)
+        # if args.save:
+        #   plt.savefig(os.path.join(results_dir,
+        #     f'{args.trans_model_type}_trans_model_v{args.trans_model_version}' + \
+        #     f'_{args.eval_unroll_steps}-step_sample_{i}.png'))
+
+        # wandb_log({f'{args.eval_unroll_steps}-step_transition_sample': img}, args.wandb)
 
 
 if __name__ == '__main__':
     # Parse args
     args = get_args()
-    # Setup logging
+    # Setup wandb
     args = init_experiment('discrete-mbrl-eval', args)
-    # Evaluate models
+    # Evaluate the models
     eval_model(args)
-    # Clean up logging
+    # Clean up wandb
     finish_experiment(args)
