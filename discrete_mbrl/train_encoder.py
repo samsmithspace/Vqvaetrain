@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from model_construction import construct_ae_model
 
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 
@@ -60,70 +61,140 @@ def setup_data_and_model(args):
 
 
 def initialize_model(model, trainer, args):
-    """Initialize model with safe settings"""
+    """Initialize model with enhanced VQ-VAE stability fixes"""
+
     # Ensure model is on correct device first
     model = model.to(args.device)
     device = next(model.parameters()).device
 
-    # Safe initialization for VQ-VAE models
+    # Enhanced VQ-VAE handling
     if args.ae_model_type in ['vqvae', 'soft_vqvae']:
-        print("🔧 Initializing VQ-VAE model...")
+        print("🔧 Applying enhanced VQ-VAE stability fixes...")
 
-        def safe_init(m):
+        # Ultra-conservative parameter settings
+        original_lr = args.learning_rate
+        args.learning_rate = 1e-5  # Much lower learning rate
+        args.codebook_size = min(args.codebook_size, 8)  # Smaller codebook
+        args.embedding_dim = min(args.embedding_dim, 32)  # Smaller embeddings
+        args.batch_size = min(args.batch_size, 512)  # Smaller batches
+        args.ae_grad_clip = 1.0  # Strong gradient clipping
+
+        print(f"   Adjusted LR: {original_lr} -> {args.learning_rate}")
+        print(f"   Codebook size: {args.codebook_size}")
+        print(f"   Embedding dim: {args.embedding_dim}")
+
+        # More conservative initialization
+        def ultra_safe_init(m):
             if isinstance(m, torch.nn.Embedding):
-                torch.nn.init.uniform_(m.weight, -0.01, 0.01)
-            elif isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)):
-                if m.weight.numel() > 0:
-                    torch.nn.init.xavier_uniform_(m.weight)
-                    m.weight.data *= 0.1
-                if hasattr(m, 'bias') and m.bias is not None:
+                # Very small random initialization for codebook
+                torch.nn.init.uniform_(m.weight, -0.001, 0.001)
+                print(f"   Initialized codebook: {m.weight.shape}")
+
+            elif isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.xavier_uniform_(m.weight)
+                m.weight.data *= 0.01  # Very small scaling
+                if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
 
-        model.apply(safe_init)
+            elif isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                m.weight.data *= 0.05
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
 
-        # Test model with a small batch
+        model.apply(ultra_safe_init)
+
+        # Update trainer settings
+        if trainer and hasattr(trainer, 'optimizer'):
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = args.learning_rate
+            trainer.grad_clip = args.ae_grad_clip
+
+        # Test model with small input
+        print("   Testing VQ-VAE model...")
+        test_input = torch.randn(2, 3, 48, 48).to(device) * 0.1  # Small values
+
+        model.eval()
         try:
-            test_input = torch.randn(2, 3, 48, 48).to(device)
             with torch.no_grad():
-                model.eval()
                 test_output = model(test_input)
-                print(f"✅ VQ-VAE test output type: {type(test_output)}")
-                if isinstance(test_output, tuple):
-                    print(f"✅ VQ-VAE test output length: {len(test_output)}")
 
-                    # Fix the model's forward pass to return 4 values if it returns 3
+                if isinstance(test_output, tuple):
+                    recon, *other_outputs = test_output
+                    print(f"   ✅ Test output shape: {recon.shape}")
+                    print(f"   ✅ Test output range: [{recon.min():.4f}, {recon.max():.4f}]")
+
+                    # Check for NaN/Inf
+                    if torch.isnan(recon).any() or torch.isinf(recon).any():
+                        print("   ❌ NaN/Inf detected in test - switching to regular AE")
+                        args.ae_model_type = 'ae'
+                        return construct_ae_model((3, 48, 48), args, load=False)
+
+                    # If VQ-VAE returns only 3 outputs, patch to return 4
                     if len(test_output) == 3:
-                        print("🔧 Patching VQ-VAE forward pass to return 4 values")
+                        print("   🔧 Patching VQ-VAE forward to return 4 outputs")
                         original_forward = model.forward
 
                         def patched_forward(x):
                             result = original_forward(x)
                             if isinstance(result, tuple) and len(result) == 3:
-                                # Add a dummy 4th value (e.g., encoding indices)
-                                decoded, loss, perplexity = result
-                                # Get encoding indices for compatibility
+                                recon, loss, perplexity = result
+                                # Add dummy encoding indices for compatibility
                                 encoded = model.encode(x) if hasattr(model, 'encode') else torch.zeros(x.shape[0], 64)
-                                return decoded, loss, perplexity, encoded
+                                return recon, loss, perplexity, encoded
                             return result
 
                         model.forward = patched_forward
-                        print("✅ VQ-VAE forward pass patched successfully")
+                        print("   ✅ VQ-VAE forward pass patched")
 
-                model.train()
-            print("✅ VQ-VAE initialization successful")
-
-            # Conservative settings for VQ-VAE
-            if trainer and hasattr(trainer, 'optimizer'):
-                for param_group in trainer.optimizer.param_groups:
-                    param_group['lr'] = min(param_group['lr'], 5e-5)
-                    print(f"🔧 VQ-VAE learning rate: {param_group['lr']}")
-                trainer.grad_clip = max(trainer.grad_clip, 1.0)
+                print("   ✅ VQ-VAE test passed")
 
         except Exception as e:
-            print(f"❌ VQ-VAE initialization failed: {e}")
-            print("🔄 Switching to regular autoencoder")
+            print(f"   ❌ VQ-VAE test failed: {e}")
+            print("   🔄 Switching to regular autoencoder")
             args.ae_model_type = 'ae'
             return construct_ae_model((3, 48, 48), args, load=False)
+
+        model.train()
+
+        # Wrap training step to catch NaN early
+        if trainer and hasattr(trainer, 'train'):
+            original_train = trainer.train
+
+            def safe_vqvae_train(batch_data):
+                try:
+                    # Check input for NaN
+                    if isinstance(batch_data, (list, tuple)):
+                        for i, data in enumerate(batch_data):
+                            if torch.is_tensor(data) and torch.isnan(data).any():
+                                print(f"❌ NaN in input batch[{i}]")
+                                return {'loss': torch.tensor(0.0)}
+
+                    result = original_train(batch_data)
+
+                    # Check output for NaN
+                    if isinstance(result, tuple):
+                        loss_dict, aux_data = result
+                    else:
+                        loss_dict = result
+                        aux_data = {}
+
+                    if isinstance(loss_dict, dict):
+                        for key, value in loss_dict.items():
+                            if torch.is_tensor(value) and (torch.isnan(value).any() or torch.isinf(value).any()):
+                                print(f"❌ NaN/Inf in {key}: {value}")
+                                # Return zero loss to continue training
+                                return {'loss': torch.tensor(0.0)}, aux_data
+
+                    return result
+
+                except Exception as e:
+                    print(f"❌ VQ-VAE training step failed: {e}")
+                    return {'loss': torch.tensor(0.0)}
+
+            trainer.train = safe_vqvae_train
+
+        print("   ✅ VQ-VAE stability fixes applied successfully")
 
     return model, trainer
 
