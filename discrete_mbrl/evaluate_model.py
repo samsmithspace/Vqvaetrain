@@ -736,6 +736,8 @@ def eval_model(args, encoder_model=None, trans_model=None):
     gc.collect()
     print('Memory usage:', psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3)
 
+    # Replace the plotting section around line 770-800 in evaluate_model.py
+
     # Create sample transition images
     print('Creating sample transition images...')
     samples = []
@@ -744,63 +746,172 @@ def eval_model(args, encoder_model=None, trans_model=None):
             break
         if sample_rollout[0].numel() > 0:
             samples.append(sample_rollout)
-    sample_rollouts = [torch.stack([x[i] for x in samples]).squeeze(dim=1) \
-                       for i in range(len(samples[0]))]
 
-    all_obs = torch.cat((sample_rollouts[0][:, :1], sample_rollouts[2]), dim=1)
-    acts = sample_rollouts[1]
-    dones = sample_rollouts[4]
-    z = encoder_model.encode(all_obs[:, 0].to(args.device))
-    if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
-        z = z.reshape(z.shape[0], encoder_model.latent_dim)
+    if len(samples) == 0:
+        print("Warning: No valid samples found for transition images")
+    else:
+        sample_rollouts = [torch.stack([x[i] for x in samples]).squeeze(dim=1) \
+                           for i in range(len(samples[0]))]
 
-    # Convert hidden states to observations (if necessary)
-    all_obs = [states_to_imgs(o, args.env_name, transform=rev_transform) for o in all_obs]
-    all_obs = torch.from_numpy(np.stack(all_obs))
+        all_obs = torch.cat((sample_rollouts[0][:, :1], sample_rollouts[2]), dim=1)
+        acts = sample_rollouts[1]
+        dones = sample_rollouts[4]
+        z = encoder_model.encode(all_obs[:, 0].to(args.device))
+        if args.trans_model_type in CONTINUOUS_TRANS_TYPES:
+            z = z.reshape(z.shape[0], encoder_model.latent_dim)
 
-    example_trans_imgs = []
-    example_trans_imgs.append(torch.cat((
-        all_obs[:, 0], torch.zeros_like(all_obs[:, 0])), dim=3))
+        # Convert hidden states to observations (if necessary)
+        all_obs = [states_to_imgs(o, args.env_name, transform=rev_transform) for o in all_obs]
+        all_obs = torch.from_numpy(np.stack(all_obs))
 
-    continue_mask = torch.ones(all_obs.shape[0])
-    for step in range(args.eval_unroll_steps):
-        z = trans_model(z, acts[:, step].to(args.device))[0]
-        pred_obs = encoder_model.decode(z).cpu()
-
-        pred_obs = states_to_imgs(pred_obs, args.env_name, transform=rev_transform)
-        pred_obs = torch.from_numpy(pred_obs)
-
+        example_trans_imgs = []
         example_trans_imgs.append(torch.cat((
-            all_obs[:, step + 1], pred_obs), dim=3) \
-                                  * continue_mask[:, None, None, None])
-        continue_mask[dones[:, step].float().nonzero().squeeze()] = 0
-    example_trans_imgs = [
-        torch.stack([x[i] for x in example_trans_imgs])
-        for i in range(len(example_trans_imgs[0]))
-    ]
+            all_obs[:, 0], torch.zeros_like(all_obs[:, 0])), dim=3))
 
-    for i, img in enumerate(example_trans_imgs):
-        img = (img.clip(0, 1) * 255).numpy().astype(np.uint8)
-        grayscale = img.shape[1] == 2 or img.shape[1] > 3
-        if grayscale:
-            img = img[:, :-1, :, :]
+        continue_mask = torch.ones(all_obs.shape[0])
+        for step in range(args.eval_unroll_steps):
+            z = trans_model(z, acts[:, step].to(args.device))[0]
+            pred_obs = encoder_model.decode(z).cpu()
 
-        log_videos({f'{args.eval_unroll_steps}-step_transition_sample': [img]}, args)
+            pred_obs = states_to_imgs(pred_obs, args.env_name, transform=rev_transform)
+            pred_obs = torch.from_numpy(pred_obs)
 
-        img = np.transpose(img, (1, 2, 0)).clip(0, 1)
+            example_trans_imgs.append(torch.cat((
+                all_obs[:, step + 1], pred_obs), dim=3) \
+                                      * continue_mask[:, None, None, None])
+            continue_mask[dones[:, step].float().nonzero().squeeze()] = 0
 
-        grayscale = img.shape[2] == 2 or img.shape[2] > 3
-        if grayscale:
-          img = img[:, :, -1]
+        example_trans_imgs = [
+            torch.stack([x[i] for x in example_trans_imgs])
+            for i in range(len(example_trans_imgs[0]))
+        ]
 
-        plt.imshow(img)
-        if args.save:
-          plt.savefig(os.path.join(results_dir,
-            f'{args.trans_model_type}_trans_model_v{args.trans_model_version}' + \
-            f'_{args.eval_unroll_steps}-step_sample_{i}.png'))
+        # Create individual full-size images for each sample
+        for i, img in enumerate(example_trans_imgs):
+            print(f"Creating transition image {i + 1}/{len(example_trans_imgs)}")
 
-        # wandb_log({f'{args.eval_unroll_steps}-step_transition_sample': img}, args.wandb)
+            # img shape: [time_steps, channels, height, width]
+            print(f"Debug: Processing sample {i}, img shape: {img.shape}")
 
+            # Convert to numpy and ensure proper range
+            img = img.clip(0, 1).cpu().numpy()
+
+            if img.ndim == 4:  # [time_steps, channels, height, width]
+                # Process each time step
+                processed_frames = []
+
+                for t in range(img.shape[0]):
+                    frame = img[t]  # [channels, height, width]
+
+                    # Convert to [height, width, channels] for display
+                    if frame.ndim == 3:
+                        frame = np.transpose(frame, (1, 2, 0))
+
+                    # Handle different channel configurations
+                    if frame.ndim == 3:
+                        if frame.shape[2] == 1:
+                            frame = frame.squeeze(2)  # Grayscale
+                        elif frame.shape[2] == 2:
+                            frame = frame[:, :, -1]  # Take last channel
+                        elif frame.shape[2] > 3:
+                            frame = frame[:, :, -1]  # Take last channel if framestack
+
+                    processed_frames.append(frame)
+
+                # Create figure showing temporal sequence
+                n_frames = len(processed_frames)
+
+                # Create horizontal layout for temporal sequence
+                fig, axes = plt.subplots(2, n_frames, figsize=(3 * n_frames, 6))
+                if n_frames == 1:
+                    axes = axes.reshape(2, 1)  # Ensure 2D array
+
+                fig.suptitle(f'Sample {i + 1}: {args.eval_unroll_steps}-step Transition Sequence',
+                             fontsize=16, y=0.95)
+
+                # Determine if images are grayscale
+                is_grayscale = processed_frames[0].ndim == 2
+                cmap = 'gray' if is_grayscale else None
+
+                for t, frame in enumerate(processed_frames):
+                    # Split the concatenated frame into ground truth and prediction
+                    if frame.ndim == 2:  # Grayscale
+                        height, width = frame.shape
+                        mid_width = width // 2
+                        ground_truth = frame[:, :mid_width]
+                        prediction = frame[:, mid_width:]
+                    else:  # Color
+                        height, width, channels = frame.shape
+                        mid_width = width // 2
+                        ground_truth = frame[:, :mid_width, :]
+                        prediction = frame[:, mid_width:, :]
+
+                    # Plot ground truth on top row
+                    axes[0, t].imshow(ground_truth, cmap=cmap)
+                    if t == 0:
+                        axes[0, t].set_title(f'Step {t}\n(Initial)', fontsize=12)
+                    else:
+                        axes[0, t].set_title(f'Step {t}\n(Ground Truth)', fontsize=12)
+                    axes[0, t].axis('off')
+
+                    # Plot prediction on bottom row
+                    axes[1, t].imshow(prediction, cmap=cmap)
+                    if t == 0:
+                        axes[1, t].set_title('(Empty)', fontsize=12)
+                    else:
+                        axes[1, t].set_title('(Prediction)', fontsize=12)
+                    axes[1, t].axis('off')
+
+                # Add row labels
+                fig.text(0.02, 0.75, 'Ground\nTruth', fontsize=14, ha='center', va='center',
+                         rotation=90, weight='bold')
+                fig.text(0.02, 0.25, 'Model\nPrediction', fontsize=14, ha='center', va='center',
+                         rotation=90, weight='bold')
+
+                # Adjust layout
+                plt.tight_layout()
+                plt.subplots_adjust(top=0.85, left=0.08)
+
+            else:
+                # Handle non-4D case (fallback)
+                fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+                if img.ndim == 3:  # [channels, height, width]
+                    display_img = np.transpose(img, (1, 2, 0))
+                    if display_img.shape[2] == 1:
+                        display_img = display_img.squeeze(2)
+                        cmap = 'gray'
+                    elif display_img.shape[2] > 3:
+                        display_img = display_img[:, :, -1]
+                        cmap = 'gray'
+                    else:
+                        cmap = None
+                else:
+                    display_img = img
+                    cmap = 'gray'
+
+                ax.imshow(display_img, cmap=cmap)
+                ax.set_title(f'Sample {i + 1}: Transition', fontsize=16)
+                ax.axis('off')
+
+            # Save the individual image
+            if args.save:
+                save_path = os.path.join(results_dir,
+                                         f'{args.trans_model_type}_trans_model_v{args.trans_model_version}' + \
+                                         f'_{args.eval_unroll_steps}-step_sample_{i + 1}.png')
+                plt.savefig(save_path, dpi=200, bbox_inches='tight')
+                print(f"Saved transition sample {i + 1} to: {save_path}")
+
+            plt.show()
+            plt.close()  # Clean up memory
+
+            # Also log video for this sample
+            img_video = (img.clip(0, 1) * 255).astype(np.uint8)
+            if img_video.shape[1] > 3:
+                img_video = img_video[:, -1:, :, :]  # Take last frame of framestack
+            log_videos({f'{args.eval_unroll_steps}-step_transition_sample_{i + 1}': [img_video]}, args)
+
+        print(f"Created {len(example_trans_imgs)} individual transition images")
 
 if __name__ == '__main__':
     # Parse args
