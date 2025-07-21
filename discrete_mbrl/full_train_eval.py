@@ -17,10 +17,15 @@ from e2e_train import full_train
 def main():
     """Main training and evaluation pipeline"""
     # Parse args
+
     args = get_args(apply_optimizations=True)
 
+
+    print(args)
     # Setup logging
     args = init_experiment('discrete-mbrl-full', args)
+    print(args)
+
 
     # Setup GPU optimizations
     if torch.cuda.is_available():

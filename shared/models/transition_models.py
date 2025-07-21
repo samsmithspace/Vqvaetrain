@@ -20,6 +20,8 @@ class DiscreteTransitionModel(nn.Module):
     self.input_dim = input_dim
     self.embedding_dim = embedding_dim
     self.n_embeddings = n_embeddings
+
+
     # When true a 1D Conv is used to embed the state
     # This can work with not truly discrete states
     self.use_soft_embeds = use_soft_embeds
@@ -55,7 +57,7 @@ class DiscreteTransitionModel(nn.Module):
       self.embeddings = nn.Identity() # nn.Conv1d(n_embeddings, embedding_dim, 1)
     else:
       self.embeddings = nn.Embedding(n_embeddings, embedding_dim)
-    
+
     hidden_sizes = [self.cb_flat_dim + self.act_dim + self.n_trans_options] + hidden_sizes
     self.shared_layers = mlp(hidden_sizes)
 
@@ -99,30 +101,71 @@ class DiscreteTransitionModel(nn.Module):
     return states.argmax(dim=dim)
 
   def prepare_acts(self, acts):
+    """Prepare action tensor ensuring proper 2D shape for concatenation."""
     if self.act_dtype == torch.long:
-      acts = F.one_hot(acts, self.act_dim).float()
-    return acts
-  
+      # Ensure acts is long type for discrete actions
+      acts = acts.long()
+
+      # Handle different input shapes
+      if acts.dim() == 1:
+        # Single step: [batch_size] -> [batch_size, act_dim]
+        acts_one_hot = F.one_hot(acts, self.act_dim).float()
+      elif acts.dim() == 2:
+        # Multi-step: [batch_size, n_steps] -> flatten and convert
+        acts_flat = acts.view(-1)
+        acts_one_hot = F.one_hot(acts_flat, self.act_dim).float()
+      else:
+        raise ValueError(f"Unexpected action tensor shape: {acts.shape}")
+
+      return acts_one_hot
+    else:
+      # Continuous actions - ensure 2D
+      acts = acts.float()
+      if acts.dim() == 1:
+        acts = acts.unsqueeze(-1)  # [batch_size] -> [batch_size, 1]
+      elif acts.dim() == 2:
+        acts = acts.view(-1, self.act_dim)  # Flatten if multi-step
+      return acts
+
   def forward(self, x: torch.Tensor, acts: torch.Tensor,
               oh_outcomes=None, return_one_hots=False,
               return_logits=False, return_stoch_logits=False):
-    # x could be longs for true discrete states or floats
-    # when using soft embeddings
     return_one_hots = return_one_hots or self.use_soft_embeds
     return_logits = return_logits or self.return_logits
-    if hasattr(self, 'embeddings') and x.dtype != torch.long:
-        print(f"Warning: Converting input from {x.dtype} to long for embedding lookup")
+
+    # Ensure x has proper shape and type for embedding lookup
+    if not self.use_soft_embeds:
+      if x.dtype != torch.long:
         x = x.long()
+
+      # Handle multi-step case: flatten batch and steps dimensions
+      if x.dim() > 2:
+        original_batch_size = x.shape[0]
+        x = x.view(-1, x.shape[-1])  # [batch*steps, latent_dim]
+      elif x.dim() == 1:
+        x = x.unsqueeze(-1)  # [batch_size] -> [batch_size, 1]
+
+    # Get embeddings and flatten
     embeds = self.embeddings(x)
     flat_embeds = embeds.view(embeds.shape[0], -1)
+
+    # Process actions to match batch dimension
     processed_acts = self.prepare_acts(acts)
+
+    # Ensure batch dimensions match
+    if flat_embeds.shape[0] != processed_acts.shape[0]:
+      min_batch = min(flat_embeds.shape[0], processed_acts.shape[0])
+      flat_embeds = flat_embeds[:min_batch]
+      processed_acts = processed_acts[:min_batch]
+
+    # Now both should be 2D with matching batch dimensions
     input_embeds = torch.cat([flat_embeds, processed_acts], dim=1)
 
     if self.stochastic == 'categorical':
-      stoch_logits = self.stoch_proj(input_embeds) # sigma logits
+      stoch_logits = self.stoch_proj(input_embeds)
       if oh_outcomes is None:
-        stoch_probs = F.softmax(stoch_logits, dim=1) # sigma
-        samples = torch.multinomial(stoch_probs, 1) # sample
+        stoch_probs = F.softmax(stoch_logits, dim=1)
+        samples = torch.multinomial(stoch_probs, 1)
         samples = samples.reshape(*stoch_probs.shape[:-1])
         oh_outcomes = F.one_hot(samples, num_classes=self.n_trans_options)
       input_embeds = torch.cat([input_embeds, oh_outcomes], dim=1)
@@ -132,18 +175,15 @@ class DiscreteTransitionModel(nn.Module):
     z = self.shared_layers(input_embeds)
 
     state_logits = self.state_head(z)
-    state_logits = state_logits.reshape(x.shape[0], self.n_embeddings, self.input_dim)
+    state_logits = state_logits.reshape(z.shape[0], self.n_embeddings, self.input_dim)
 
     reward = self.reward_head(z)
-
-    gamma = self.gamma_head(z)
-    gamma = torch.sigmoid(gamma)
+    gamma = torch.sigmoid(self.gamma_head(z))
 
     if return_logits:
       out_states = state_logits
     else:
-      out_states = self.logits_to_state(
-        state_logits, one_hot=return_one_hots)
+      out_states = self.logits_to_state(state_logits, one_hot=return_one_hots)
 
     if return_stoch_logits:
       return out_states, reward, gamma, stoch_logits
@@ -223,7 +263,7 @@ class ContinuousTransitionModel(nn.Module):
     if self.act_dtype == torch.long:
       acts = F.one_hot(acts, self.act_dim).float()
     return acts
-      
+
   def forward(self, x: torch.FloatTensor, acts: torch.Tensor,
               oh_outcomes=None, return_logits=False,
               return_stoch_logits: bool = False):
@@ -260,7 +300,7 @@ class ContinuousTransitionModel(nn.Module):
     if return_stoch_logits:
       return states, reward, gamma, stoch_logits
     return states, reward, gamma
-  
+
 
 class UniversalVQTransitionModel(nn.Module):
   def __init__(self, input_dim, n_embeddings, embedding_dim, act_space,
@@ -342,7 +382,7 @@ class UniversalVQTransitionModel(nn.Module):
       assert n_embeddings == embedding_dim, \
         'Embedding dim must match n_embeddings or use 1d conv'
       self.embeddings = nn.Identity()
-    
+
     hidden_sizes = [self.cb_flat_dim + self.act_dim + self.n_trans_options] + hidden_sizes
     self.shared_layers = mlp(hidden_sizes)
 
@@ -370,7 +410,7 @@ class UniversalVQTransitionModel(nn.Module):
 
     if self.stochastic != 'categorical':
       raise ValueError('Can only discretize if stochasticity type is categorical!')
-    
+
     if not self.use_soft_embeds:
       # Convert x to one hot
       x = F.one_hot(x, self.n_embeddings).float()
@@ -417,7 +457,7 @@ class UniversalVQTransitionModel(nn.Module):
     if self.act_dtype == torch.long:
       acts = F.one_hot(acts, self.act_dim).float()
     return acts
-  
+
   def forward(self, x: torch.Tensor, acts: torch.Tensor,
               oh_outcomes=None, return_one_hots=False,
               return_logits=False, return_stoch_logits=False):
@@ -528,12 +568,12 @@ class TransformerTransitionModel(nn.Module):
         batch_first=True
     )
     self.out = nn.Linear(embedding_dim, n_embeddings)
-      
+
   def prepare_acts(self, acts):
     if self.act_dtype == torch.long:
       acts = F.one_hot(acts, self.act_dim).float()
     return acts
-  
+
   def forward(self, state, acts, tgt=None, tgt_mask=None, src_pad_mask=None,
               tgt_pad_mask=None, return_logits=False):
     # State size must be (batch_size, state sequence length)
@@ -594,23 +634,23 @@ class TransformerTransitionModel(nn.Module):
       samples = samples.reshape(*probs.shape[:-1])
       return samples, torch.tensor(0), torch.tensor(1)
     return state_logits.argmax(dim=2), torch.tensor(0), torch.tensor(1)
-    
+
   def get_tgt_mask(self, size) -> torch.tensor:
     # Generates a squeare matrix where the each row allows one word more to be seen
     mask = torch.tril(torch.ones(size, size) == 1) # Lower triangular matrix
     mask = mask.float()
     mask = mask.masked_fill(mask == 0, float('-inf')) # Convert zeros to -inf
     mask = mask.masked_fill(mask == 1, float(0.0)) # Convert ones to 0
-    
+
     # EX for size=5:
     # [[0., -inf, -inf, -inf, -inf],
     #  [0.,   0., -inf, -inf, -inf],
     #  [0.,   0.,   0., -inf, -inf],
     #  [0.,   0.,   0.,   0., -inf],
     #  [0.,   0.,   0.,   0.,   0.]]
-    
+
     return mask
-  
+
   def create_pad_mask(self, matrix: torch.tensor, pad_token: int) -> torch.tensor:
     # If matrix = [1,2,3,0,0,0] where pad_token=0, the result mask is
     # [False, False, False, True, True, True]
@@ -651,7 +691,7 @@ class TransformerDecTransitionModel(nn.Module):
         num_layers=num_decoder_layers
     )
     self.out = nn.Linear(embedding_dim, n_embeddings)
-      
+
   def logits_to_state(self, logits: torch.FloatTensor):
     if self.stochastic in ('simple', 'categorical'):
       return sample_one_hot(logits)
@@ -664,7 +704,7 @@ class TransformerDecTransitionModel(nn.Module):
 
     output_start_tokens = torch.full(
       (src.shape[0], 1), self.special_token, dtype=torch.long, device=src.device)
-    
+
     tgt = output_start_tokens
     out_logits = []
     while tgt.shape[1] <= state.shape[1]:
@@ -735,7 +775,7 @@ class TransformerDecTransitionModel(nn.Module):
 
     states = self.logits_to_state(state_logits)
     return states.argmax(dim=-1), torch.tensor(0), torch.tensor(1)
-    
+
   def get_tgt_mask(self, src_act_size, tgt_size) -> torch.tensor:
     # Generates a square matrix where the each row allows one word more to be seen
     full_size = src_act_size + tgt_size
@@ -744,12 +784,12 @@ class TransformerDecTransitionModel(nn.Module):
     mask = mask.float()
     mask = mask.masked_fill(mask == 0, float('-inf')) # Convert zeros to -inf
     mask = mask.masked_fill(mask == 1, float(0.0)) # Convert ones to 0
-    
+
     # EX for size=5:
     # [[0., -inf, -inf, -inf, -inf],
     #  [0.,   0., -inf, -inf, -inf],
     #  [0.,   0.,   0., -inf, -inf],
     #  [0.,   0.,   0.,   0., -inf],
     #  [0.,   0.,   0.,   0.,   0.]]
-    
+
     return mask
