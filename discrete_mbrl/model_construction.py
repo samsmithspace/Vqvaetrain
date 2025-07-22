@@ -317,6 +317,8 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
 
         elif args.ae_model_type == 'soft_vqvae':  # VQVAE with quantized latent space
             n_latents = args.latent_dim if encoder_type == 'dense' else None
+
+
             model = VQVAEModel(
                 input_dim, codebook_size=args.codebook_size, embedding_dim=args.embedding_dim,
                 encoder=encoder, decoder=decoder, n_latents=n_latents, quantized_enc=True,
@@ -337,6 +339,10 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
         n_latents = args.latent_dim if encoder_type == 'dense' else None
 
         if args.ae_model_type == 'vqvae':
+
+            print(n_latents)
+            print("--------------")
+
             model = VQVAEModel(
                 input_dim, codebook_size=args.codebook_size, embedding_dim=args.embedding_dim,
                 encoder=encoder, decoder=decoder, n_latents=n_latents)

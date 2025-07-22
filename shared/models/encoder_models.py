@@ -410,6 +410,7 @@ class VQVAEModel(nn.Module):
     self.embedding_dim = embedding_dim
     self.n_embeddings = embedding_dim if quantized_enc else codebook_size
     self.quantized_enc = quantized_enc
+
     self.encoder = encoder or create_encoder(obs_dim)
     self.quantizer = VectorQuantizerEMA(
       codebook_size, embedding_dim,
@@ -419,7 +420,7 @@ class VQVAEModel(nn.Module):
     test_input = torch.ones(1, *obs_dim, dtype=torch.float32)
     self.encoder_out_shape = self.encoder(test_input).shape[1:]
     self.n_latent_embeds = np.prod(self.encoder_out_shape[1:])
-    
+
     if n_latents is not None:
       if len(self.encoder_out_shape) == 1:
         # When the encoder has a flat output, make a layer to create channels
@@ -449,6 +450,7 @@ class VQVAEModel(nn.Module):
 
     # Flat representation size
     # num classes x num vectors in a single latent vector
+
     self.latent_dim = self.n_embeddings * self.n_latent_embeds
 
   def get_codebook(self):
