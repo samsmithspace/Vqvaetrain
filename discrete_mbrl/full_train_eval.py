@@ -21,7 +21,7 @@ def main():
     args = get_args(apply_optimizations=True)
 
 
-    print(args)
+
     # Setup logging
     args = init_experiment('discrete-mbrl-full', args)
     print(args)

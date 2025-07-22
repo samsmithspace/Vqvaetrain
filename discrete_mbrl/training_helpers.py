@@ -58,8 +58,14 @@ def get_optimized_args(args):
 
     # Enable data preloading for smaller datasets
     if not hasattr(args, 'preload_data') or not args.preload_data:
+        # Enable preloading for smaller datasets to avoid HDF5 delays
         if args.max_transitions and args.max_transitions < 500000:
             args.preload_data = True
+            print("Enabled data preloading to reduce HDF5 access delays")
+
+    # Disable persistent workers on first epoch to avoid setup delays
+    if not hasattr(args, 'persistent_workers'):
+        args.persistent_workers = False  # Set to False initially
 
     # Reduce validation frequency to avoid GPU idle time
     args.log_freq = max(args.log_freq, 500)
@@ -368,6 +374,10 @@ def validate_args(args):
 
 
 def log_param_updates(args, params):
+    # Skip logging during model construction to avoid network delays
+    if getattr(args, '_skip_param_logging', False):
+        return
+
     if args.wandb:
         import wandb
         if not isinstance(wandb.config, wandb.sdk.lib.preinit.PreInitObject):
@@ -438,11 +448,18 @@ def train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
         print('Memory usage: {:.1f} GB'.format(
             psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3))
 
-        # Add progress bar for epoch
+        # Add progress bar for epoch with better description
         epoch_iterator = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}",
                               unit="batch", leave=True)
 
+        print(f"Loading first batch for epoch {epoch + 1}...")  # Add this
+
         for i, batch_data in enumerate(epoch_iterator):
+            if i == 0:
+                print("First batch loaded, starting training...")  # Add this
+
+
+            # ... rest of the function
             train_loss, aux_data = trainer.train(batch_data)
             if not isinstance(train_loss, dict):
                 train_loss = {'loss': train_loss}

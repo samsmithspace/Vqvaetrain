@@ -22,7 +22,7 @@ aux_log_buffer = defaultdict(list)
 
 def full_train(args):
     import_logger(args)
-        
+
     print('Loading data...')
     # Data shape: (5, batch_size, n_steps, ...)
     train_loader, test_loader, valid_loader = prepare_dataloaders(
@@ -135,6 +135,7 @@ def full_train(args):
         print('Transition model saved')
 
     return encoder_model, trans_model
+
 
 if __name__ == '__main__':
     # Parse args
