@@ -432,15 +432,29 @@ def train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
     torch.manual_seed(seed)
     model.train()
     train_losses = []
+
     for epoch in range(n_epochs):
         print(f'Starting epoch #{epoch}')
         print('Memory usage: {:.1f} GB'.format(
             psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3))
-        for i, batch_data in enumerate(train_loader):
+
+        # Add progress bar for epoch
+        epoch_iterator = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}",
+                              unit="batch", leave=True)
+
+        for i, batch_data in enumerate(epoch_iterator):
             train_loss, aux_data = trainer.train(batch_data)
             if not isinstance(train_loss, dict):
                 train_loss = {'loss': train_loss}
             train_losses.append(train_loss)
+
+            # Update progress bar with current loss
+            if len(train_losses) > 0:
+                current_loss = train_losses[-1].get('loss', 0)
+                if hasattr(current_loss, 'item'):
+                    current_loss = current_loss.item()
+                epoch_iterator.set_postfix({'loss': f'{current_loss:.4f}'})
+
             if callback:
                 callback(train_loss, i * batch_size, epoch, aux_data=aux_data)
             if i % log_freq == 0:

@@ -340,8 +340,6 @@ def construct_ae_model(input_dim, args, load=True, latent_activation=False):
 
         if args.ae_model_type == 'vqvae':
 
-            print(n_latents)
-            print("--------------")
 
             model = VQVAEModel(
                 input_dim, codebook_size=args.codebook_size, embedding_dim=args.embedding_dim,
