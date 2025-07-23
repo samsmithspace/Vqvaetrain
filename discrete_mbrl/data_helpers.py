@@ -122,15 +122,23 @@ class ObsTransforms:
 
 
 class NStepReplayDataset(Dataset):
-    def __init__(self, env_name, n_steps, transform=None, cross_chunks=True, preload=False,
+    def __init__(self, env_name, transform=None, preload=False,
                  start_idx=0, end_idx=None, extra_buffer_keys=None):
+        import time
+        start_time = time.time()
+        print(f'🕐 Initializing ReplayDataset for {env_name}')
+
         sanitized_env_name = env_name.replace(':', '_')
+        extra_buffer_keys = extra_buffer_keys or []
         self.replay_buffer_path = f'{DATA_DIR}/{sanitized_env_name}_replay_buffer.hdf5'
-        self.n_steps = n_steps
         self.transform = transform
-        self.cross_chunks = cross_chunks
         self.preload = preload
+
+        print(f'🕐 Opening HDF5 file: {self.replay_buffer_path}')
+        h5_start = time.time()
         with h5py.File(self.replay_buffer_path, 'r') as buffer:
+            print(f'⏱️  HDF5 file opened in {time.time() - h5_start:.2f}s')
+
             self.act_type = buffer.get('action').dtype
             self.act_type = torch.float32 if 'float' in str(self.act_type) else torch.int64
             self.chunk_size = buffer['obs'].chunks[0]
@@ -565,12 +573,16 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
     Modified to include GPU optimization parameters and Windows multiprocessing fix
     """
     import platform
+    import time
+
+    start_time = time.time()
+    print(f'🕐 Starting prepare_dataloaders for {env_name}')
 
     # Windows multiprocessing fix - force n_preload to 0 on Windows
     if platform.system() == 'Windows':
         n_preload = 0
         persistent_workers = False
-        print("Windows detected - disabling multiprocessing to avoid pickle errors")
+        print("🪟 Windows detected - disabling multiprocessing to avoid pickle errors")
 
     # Set optimization defaults
     if pin_memory is None:
@@ -578,6 +590,8 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
     if persistent_workers is None:
         persistent_workers = n_preload > 0
 
+    print('🕐 Creating dataset...')
+    dataset_start = time.time()
     transform = preprocess_transform if preprocess else None
     if n_step > 1:
         dataset = NStepReplayDataset(
@@ -587,6 +601,8 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
         dataset = ReplayDataset(
             env_name, transform, preload=preload_all,
             extra_buffer_keys=extra_buffer_keys)
+    print(f'⏱️  Dataset created in {time.time() - dataset_start:.2f}s')
+
     if n and n < len(dataset):
         dataset.length = min(dataset.length, n)
 
@@ -594,9 +610,15 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
     n_test = min(int(n * TEST_FRAC), MAX_TEST)
     n_valid = min(int(n * VALID_FRAC), MAX_VALID)
     n_train = n - n_test - n_valid
+
+    print('🕐 Creating dataset subsets...')
+    subset_start = time.time()
     train_dataset = Subset(dataset, torch.arange(n_train))
     test_dataset = Subset(dataset, torch.arange(n_train, n - n_valid))
+    print(f'⏱️  Subsets created in {time.time() - subset_start:.2f}s')
 
+    print('🕐 Creating validation dataset...')
+    valid_start = time.time()
     if valid_preload and not preload_all:
         if n_step > 1:
             valid_dataset = NStepReplayDataset(env_name, n_step, transform=transform,
@@ -607,6 +629,7 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
                                           start_idx=n - n_valid, end_idx=n, extra_buffer_keys=extra_buffer_keys)
     else:
         valid_dataset = Subset(dataset, torch.arange(n - n_valid, n))
+    print(f'⏱️  Validation dataset created in {time.time() - valid_start:.2f}s')
 
     if seed is not None and randomize:
         torch.manual_seed(seed)
@@ -615,6 +638,8 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
     weak_shuffle = not preload_all
     valid_weak_shuffle = not valid_preload and not preload_all
 
+    print('🕐 Creating data loaders...')
+    loader_start = time.time()
     # Use optimized data loaders
     train_loader = create_fast_loader(
         train_dataset, batch_size, randomize, n_preload, n_step, weak_shuffle,
@@ -630,7 +655,9 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
         valid_dataset, batch_size, False, min(n_preload, 2), n_step, valid_weak_shuffle,
         pin_memory=pin_memory, persistent_workers=persistent_workers and n_preload > 0,
         prefetch_factor=prefetch_factor)
+    print(f'⏱️  Data loaders created in {time.time() - loader_start:.2f}s')
 
+    print(f'⏱️  Total prepare_dataloaders took {time.time() - start_time:.2f}s')
     return train_loader, test_loader, valid_loader
 
 

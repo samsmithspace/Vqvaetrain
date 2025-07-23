@@ -21,27 +21,36 @@ aux_log_buffer = defaultdict(list)
 
 
 def full_train(args):
+    start_time = time.time()
     import_logger(args)
 
-    print('Loading data...')
+    print('🕐 Loading data...')
+    data_start = time.time()
     # Data shape: (5, batch_size, n_steps, ...)
     train_loader, test_loader, valid_loader = prepare_dataloaders(
         args.env_name, n=args.max_transitions, batch_size=args.batch_size,
         n_step=args.n_train_unroll, preprocess=args.preprocess, randomize=True,
         n_preload=args.n_preload, preload_all=args.preload_data,
         extra_buffer_keys=args.extra_buffer_keys)
+    print(f'⏱️  Data loaders created in {time.time() - data_start:.2f}s')
 
-    print(f'Data split: {len(train_loader.dataset)}/{len(test_loader.dataset)}/{len(valid_loader.dataset)}')
+    print(f'📊 Data split: {len(train_loader.dataset)}/{len(test_loader.dataset)}/{len(valid_loader.dataset)}')
 
+    print('🕐 Getting first sample...===================================')
     pre_sample_time = time.time()
-    print('Sample time:', time.time() - pre_sample_time)
-
-    print('Constructing encoder...')
     sample_obs = next(iter(train_loader))[0][0]
     if args.n_train_unroll > 1:
         sample_obs = sample_obs[0]
+    sample_time = time.time() - pre_sample_time
+    print(f'⏱️  First sample obtained in {sample_time:.2f}s')
+    print(f'⏱️  Total data loading took {time.time() - start_time:.2f}s')
+
+    print('🕐 Constructing encoder...')
+    encoder_start = time.time()
     encoder_model = construct_ae_model(
         sample_obs.shape, args, load=args.load)[0]
+    print(f'⏱️  Encoder construction took {time.time() - encoder_start:.2f}s')
+
     if hasattr(encoder_model, 'disable_sparsity'):
         encoder_model.disable_sparsity()
     encoder_model = encoder_model.to(args.device)

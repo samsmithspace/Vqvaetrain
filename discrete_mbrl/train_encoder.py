@@ -12,35 +12,52 @@ from env_helpers import *
 from training_helpers import *
 from model_construction import *
 from data_logging import *
-
+import time
 ENCODER_STEP = 0
 train_log_buffer = defaultdict(float)
 
 
 def train_encoder(args):
-    print('Loading data...')
+    start_time = time.time()
+    print('🕐 Loading data...')
+
     if args.unique_data:
-        # In this case there is no valid/test data split
+        print('🕐 Creating unique data loader...')
+        data_start = time.time()
         train_loader = test_loader = \
             prepare_unique_obs_dataloader(args, randomize=True)
         valid_loader = None
+        print(f'⏱️  Unique data loader created in {time.time() - data_start:.2f}s')
     else:
+        print('🕐 Creating standard data loaders...')
+        data_start = time.time()
         train_loader, test_loader, valid_loader = prepare_dataloaders(
             args.env_name, n=args.max_transitions, batch_size=args.batch_size,
             preprocess=args.preprocess, randomize=True, n_preload=args.n_preload,
             preload_all=args.preload_data, extra_buffer_keys=args.extra_buffer_keys)
+        print(f'⏱️  Data loaders created in {time.time() - data_start:.2f}s')
 
     valid_len = len(valid_loader.dataset) if valid_loader is not None else 0
-    print(f'Data split: {len(train_loader.dataset)}/{len(test_loader.dataset)}/{valid_len}')
+    print(f'📊 Data split: {len(train_loader.dataset)}/{len(test_loader.dataset)}/{valid_len}')
+    print(f'⏱️  Total data loading took {time.time() - start_time:.2f}s')
 
-    print('Constructing model...')
+    print('🕐 Constructing model...')
+    model_start = time.time()
+
+    print('🕐 Getting first sample...')
     pre_sample_time = time.time()
     sample_obs = next(iter(train_loader))[0]
-    print('Sample time:', time.time() - pre_sample_time)
-    print('Sample shape:', sample_obs.shape)
+    sample_time = time.time() - pre_sample_time
+    print(f'⏱️  First sample obtained in {sample_time:.2f}s')
+    print(f'📦 Sample shape: {sample_obs.shape}')
 
+    print('🕐 Creating model architecture...')
+    construct_start = time.time()
     model, trainer = construct_ae_model(
         sample_obs.shape[1:], args, load=args.load)
+    print(f'⏱️  Model construction took {time.time() - construct_start:.2f}s')
+    print(f'⏱️  Total model setup took {time.time() - model_start:.2f}s')
+
     update_params(args)
     track_model(model, args)
 
@@ -52,15 +69,29 @@ def train_encoder(args):
 
     if trainer is not None:
         trainer.recon_loss_clip = args.recon_loss_clip
+
+    print('🕐 Moving model to device...')
+    device_start = time.time()
     model = model.to(args.device)
+    print(f'⏱️  Model moved to {args.device} in {time.time() - device_start:.2f}s')
+
     print('# Params:', sum([x.numel() for x in model.parameters()]))
     print(model)
 
     def train_callback(train_data, batch_idx, epoch, **kwargs):
         global ENCODER_STEP, train_log_buffer
-        if args.save and epoch % args.checkpoint_freq == 0 and batch_idx == 0:
-            save_model(model, args, model_hash=args.ae_model_hash)
+        import time
 
+        print(f"🕐 train_callback called for batch {batch_idx}, epoch {epoch}")
+        callback_start = time.time()
+
+        if args.save and epoch % args.checkpoint_freq == 0 and batch_idx == 0:
+            print("🕐 Saving model...")
+            save_start = time.time()
+            save_model(model, args, model_hash=args.ae_model_hash)
+            print(f"⏱️  Model saving took {time.time() - save_start:.2f}s")
+
+        print("🕐 Processing training data...")
         for k, v in train_data.items():
             if isinstance(v, torch.Tensor):
                 v = v.item()
@@ -68,6 +99,8 @@ def train_encoder(args):
             train_log_buffer[f'{k}_count'] += 1
 
         if ENCODER_STEP % max(1, (args.log_freq // 10)) == 0:
+            print("🕐 Logging metrics...")
+            log_start = time.time()
             log_stats = {}
             for k, v in train_log_buffer.items():
                 if k.endswith('_count'):
@@ -79,9 +112,11 @@ def train_encoder(args):
                 'step': ENCODER_STEP,
                 **log_stats},
                 args, prefix='encoder', step=ENCODER_STEP)
+            print(f"⏱️  Metric logging took {time.time() - log_start:.2f}s")
             train_log_buffer = defaultdict(float)
 
         ENCODER_STEP += 1
+        print(f"⏱️  train_callback completed in {time.time() - callback_start:.2f}s")
 
     env = make_env(args.env_name, max_steps=args.env_max_steps)
     # For reversing observation transformations
@@ -105,6 +140,8 @@ def train_encoder(args):
                 'train_img_recon': train_recons},
                 args, prefix='encoder', step=ENCODER_STEP)
 
+    print('🕐 Starting train_loop...')
+    train_loop_start = time.time()
     try:
         train_loop(
             model, trainer, train_loader, valid_loader, args.epochs,
@@ -112,6 +149,8 @@ def train_encoder(args):
             valid_callback=valid_callback)
     except KeyboardInterrupt:
         print('Stopping training')
+
+    print(f'⏱️  train_loop completed in {time.time() - train_loop_start:.2f}s')
 
     # Get rid of any remaining log data
     global train_log_buffer
