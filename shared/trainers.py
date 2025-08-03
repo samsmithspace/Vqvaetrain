@@ -433,11 +433,11 @@ class VQVAETrainer(BaseRepresentationLearner):
         import time
         step_start = time.time()
 
-        print("🕐 Starting VQVAETrainer.train()...")
-        print("🕐 Calculating losses...")
-        loss_start = time.time()
+        #print("🕐 Starting VQVAETrainer.train()...")
+        #print("🕐 Calculating losses...")
+        #loss_start = time.time()
         loss_dict, stats = self.calculate_losses(batch_data, return_stats=True)
-        print(f"⏱️  Loss calculation took {time.time() - loss_start:.2f}s")
+        #print(f"⏱️  Loss calculation took {time.time() - loss_start:.2f}s")
 
         # Check for NaN in individual loss components before summing
         nan_losses = []
@@ -451,10 +451,10 @@ class VQVAETrainer(BaseRepresentationLearner):
             return loss_dict, stats
 
         # Calculate total loss
-        print("🕐 Computing total loss...")
-        loss_sum_start = time.time()
+        #print("🕐 Computing total loss...")
+        #loss_sum_start = time.time()
         loss = torch.sum(torch.stack(tuple(loss_dict.values())))
-        print(f"⏱️  Loss summing took {time.time() - loss_sum_start:.2f}s")
+        #print(f"⏱️  Loss summing took {time.time() - loss_sum_start:.2f}s")
 
         # Enhanced logging with individual components
         if self.log_freq > 0 and self.train_step % self.log_freq == 0:
@@ -464,36 +464,36 @@ class VQVAETrainer(BaseRepresentationLearner):
             print(log_str)
 
         # Gradient computation and checking
-        print("🕐 Zeroing gradients...")
+        #print("🕐 Zeroing gradients...")
         grad_zero_start = time.time()
         self.optimizer.zero_grad()
-        print(f"⏱️  Gradient zeroing took {time.time() - grad_zero_start:.2f}s")
+        #print(f"⏱️  Gradient zeroing took {time.time() - grad_zero_start:.2f}s")
 
         try:
-            print("🕐 Computing gradients (backward pass)...")
+            #print("🕐 Computing gradients (backward pass)...")
             backward_start = time.time()
             loss.backward()
-            print(f"⏱️  Backward pass took {time.time() - backward_start:.2f}s")
+            #print(f"⏱️  Backward pass took {time.time() - backward_start:.2f}s")
 
             # Apply gradient clipping if specified
             if self.grad_clip > 0:
-                print("🕐 Clipping gradients...")
+                #print("🕐 Clipping gradients...")
                 clip_start = time.time()
                 grad_norm_before = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                print(f"⏱️  Gradient clipping took {time.time() - clip_start:.2f}s")
+                #print(f"⏱️  Gradient clipping took {time.time() - clip_start:.2f}s")
 
             # Parameter update
-            print("🕐 Updating parameters (optimizer step)...")
+            #print("🕐 Updating parameters (optimizer step)...")
             step_start_time = time.time()
             self.optimizer.step()
-            print(f"⏱️  Optimizer step took {time.time() - step_start_time:.2f}s")
+            #print(f"⏱️  Optimizer step took {time.time() - step_start_time:.2f}s")
 
         except Exception as e:
             print(f"❌ Error during backward pass or optimization: {e}")
             return loss_dict, stats
 
         self.train_step += 1
-        print(f"⏱️  Total VQVAETrainer.train() took {time.time() - step_start:.2f}s")
+        #print(f"⏱️  Total VQVAETrainer.train() took {time.time() - step_start:.2f}s")
         return loss_dict, stats
 
         # Calculate total loss

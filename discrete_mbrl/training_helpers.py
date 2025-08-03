@@ -43,7 +43,7 @@ def get_optimized_args(args):
 
         # Scale batch size based on GPU memory
         if gpu_memory >= 8:
-            args.batch_size = max(args.batch_size, 2048)
+            args.batch_size = max(args.batch_size, 1024)
             args.eval_batch_size = max(args.eval_batch_size, 512)
         if gpu_memory >= 16:
             args.batch_size = max(args.batch_size, 4096)
@@ -445,96 +445,56 @@ def train_loop(model, trainer, train_loader, valid_loader=None, n_epochs=1,
     train_losses = []
 
     for epoch in range(n_epochs):
-        print(f'🕐 Starting epoch #{epoch}')
+        #print(f'🕐 Starting epoch #{epoch}')
         epoch_start = time.time()
-        print('Memory usage: {:.1f} GB'.format(
-            psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3))
 
-        # Add progress bar for epoch with better description
         epoch_iterator = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}",
                               unit="batch", leave=True)
 
-        print(f"🕐 Loading first batch for epoch {epoch + 1}...")
-        batch_start_time = time.time()
-
         for i, batch_data in enumerate(epoch_iterator):
-            if i == 0:
-                print(f"⏱️  First batch loaded in {time.time() - batch_start_time:.2f}s")
-                print("🕐 Starting training on first batch...")
-                train_start_time = time.time()
-
-            if i == 1:
-                print("🕐 Loading second batch...")
-                second_batch_start = time.time()
-
-            # Detailed timing for first batch
-            if i == 0:
-                print("🕐 Calling trainer.train()...")
-                trainer_start = time.time()
-
             train_loss, aux_data = trainer.train(batch_data)
-
-            if i == 0:
-                print(f"⏱️  trainer.train() completed in {time.time() - trainer_start:.2f}s")
-                print(f"⏱️  First batch training took {time.time() - train_start_time:.2f}s")
-            elif i == 1:
-                print(f"⏱️  Second batch loaded and trained in {time.time() - second_batch_start:.2f}s")
 
             if not isinstance(train_loss, dict):
                 train_loss = {'loss': train_loss}
             train_losses.append(train_loss)
 
-            # Update progress bar with current loss
+            # Update progress bar
             if len(train_losses) > 0:
                 current_loss = train_losses[-1].get('loss', 0)
                 if hasattr(current_loss, 'item'):
                     current_loss = current_loss.item()
                 epoch_iterator.set_postfix({'loss': f'{current_loss:.4f}'})
 
-            print(f"🕐 Calling callback for batch {i}...")
-            callback_start = time.time()
             if callback:
                 callback(train_loss, i * batch_size, epoch, aux_data=aux_data)
-            print(f"⏱️  Callback completed in {time.time() - callback_start:.2f}s")
 
-            if i % log_freq == 0:
-                print(f"🕐 Processing log_freq step (i={i}, log_freq={log_freq})...")
-                log_start = time.time()
+            # 🚀 FIX: Skip validation on first few steps AND reduce frequency
+            should_validate = (
+                    i > 0 and  # Skip step 0
+                    i % log_freq == 0 and
+                    valid_loader is not None and
+                    i % (log_freq * 2) == 0  # Validate only every 2nd log_freq
+            )
 
-                train_loss_means = {k: np.mean([x[k].item() for x in train_losses])
-                                    for k in train_losses[0]}
-                train_losses = []
+            if should_validate:
+                #print("🕐 Running validation...")
+                valid_start = time.time()
+                test_func = test_func or trainer.calculate_losses
+                valid_losses = test_model(model, test_func, valid_loader)
+                #print(f"⏱️  Validation took {time.time() - valid_start:.2f}s")
 
-                update_str = f'Epoch {epoch} | Samples {i * batch_size}'
-                for k, v in train_loss_means.items():
-                    update_str += f' | train_{k}: {v:.3f}'
+                valid_loss_means = {k: np.mean([x[k].item() for x in valid_losses])
+                                    for k in valid_losses[0]}
 
-                if valid_loader is not None:
-                    print("🕐 Running validation...")
-                    valid_start = time.time()
-                    test_func = test_func or trainer.calculate_losses
-                    valid_losses = test_model(
-                        model, test_func, valid_loader)
-                    print(f"⏱️  Validation took {time.time() - valid_start:.2f}s")
+                if valid_callback:
+                    #print("🕐 Calling valid_callback...")
+                    valid_callback_start = time.time()
+                    valid_callback(valid_loss_means, i, epoch)
+                    #print(f"⏱️  valid_callback took {time.time() - valid_callback_start:.2f}s")
 
-                    valid_loss_means = {k: np.mean([x[k].item() for x in valid_losses])
-                                        for k in valid_losses[0]}
-                    if valid_callback:
-                        print("🕐 Calling valid_callback...")
-                        valid_callback_start = time.time()
-                        valid_callback(valid_loss_means, i, epoch)
-                        print(f"⏱️  valid_callback took {time.time() - valid_callback_start:.2f}s")
-                    for k, v in valid_loss_means.items():
-                        update_str += f' | valid_{k}: {v:.3f}'
-                    model.train()
-                print(update_str)
-                print(f"⏱️  Log processing took {time.time() - log_start:.2f}s")
+                model.train()  # Ensure model is back in training mode
 
-            print(f"🕐 Completed batch {i}, moving to next batch...")
-            if i >= 2:  # Stop detailed debugging after a few batches
-                break
-
-        print(f'⏱️  Epoch {epoch} completed in {time.time() - epoch_start:.2f}s')
+        #print(f'⏱️  Epoch {epoch} completed in {time.time() - epoch_start:.2f}s')
 
 
 def sample_recon_seqs(encoder, trans_model, dataloader, n_steps, n=4,

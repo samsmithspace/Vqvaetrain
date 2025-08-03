@@ -1,469 +1,331 @@
-#!/usr/bin/env python3
-"""
-Encoder Model Evaluation Script
-Focused evaluation of autoencoder models without transition model components.
-"""
+# 1. Environment Testing Script - Run this first to identify the issue
 
-import gc
-import psutil
 import os
 import sys
-import time
-
-sys.path.insert(1, os.path.join(sys.path[0], '..'))
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-import seaborn as sns
+import traceback
 import torch
-from tqdm import tqdm
+import numpy as np
+from pathlib import Path
 
-from shared.models import *
-from shared.trainers import *
-from data_helpers import *
-from data_logging import *
-from env_helpers import *
-from training_helpers import *
-from model_construction import *
-from utils import *
 
-sns.set()
-
-# Configuration constants
-SEED = 0  # Should be same as seed used for training
-PRELOAD_TEST = False
-TEST_WORKERS = 0
-N_RAND_LATENT_SAMPLES = 500
-N_EXAMPLE_IMGS = 15
-DISCRETE_ENCODER_TYPES = ('vqvae', 'dae', 'softmax_ae', 'hard_fta_ae')
-CONTINUOUS_ENCODER_TYPES = ('ae', 'vae', 'soft_vqvae', 'fta_ae')
-
-
-def setup_evaluation_environment(args):
-    """Setup data loaders and basic environment for evaluation"""
-    print('Loading test data...')
-
-    test_loader = prepare_dataloader(
-        args.env_name, 'test', batch_size=args.batch_size, preprocess=args.preprocess,
-        randomize=False, n=args.max_transitions, n_preload=TEST_WORKERS, preload=args.preload_data,
-        extra_buffer_keys=args.extra_buffer_keys)
-
-    test_sampler = create_fast_loader(
-        test_loader.dataset, batch_size=1, shuffle=True, num_workers=TEST_WORKERS, n_step=1)
-
-    rev_transform = test_loader.dataset.flat_rev_obs_transform
-
-    print(f'Test dataset size: {len(test_loader.dataset)}')
-
-    return test_loader, test_sampler, rev_transform
-
-
-def load_and_setup_encoder(args, test_sampler):
-    """Load and setup the encoder model"""
-    print('Loading encoder model...')
-
-    # Get sample observation shape
-    sample_obs = next(iter(test_sampler))[0]
-
-    # Load the encoder
-    encoder_model, trainer = construct_ae_model(sample_obs.shape[1:], args, load=args.load)
-    encoder_model = encoder_model.to(args.device)
-    freeze_model(encoder_model)
-    encoder_model.eval()
-
-    if hasattr(encoder_model, 'enable_sparsity'):
-        encoder_model.enable_sparsity()
-
-    print(f'Loaded encoder: {type(encoder_model).__name__}')
-    print(f'Encoder parameters: {sum(p.numel() for p in encoder_model.parameters()):,}')
-
-    # Determine encoder type
-    if args.ae_model_type in DISCRETE_ENCODER_TYPES:
-        encoder_type = 'discrete'
-    elif args.ae_model_type in CONTINUOUS_ENCODER_TYPES:
-        encoder_type = 'continuous'
-    else:
-        encoder_type = 'other'
-
-    return encoder_model, trainer, encoder_type
-
-
-def evaluate_reconstruction_performance(encoder_model, test_loader, args):
-    """Evaluate autoencoder reconstruction performance"""
-    print('\n🔍 EVALUATING RECONSTRUCTION PERFORMANCE')
-    print('=' * 50)
-
-    # Calculate reconstruction loss
-    n_samples = 0
-    total_recon_loss = 0.0
-    mse_losses = []
-
-    device = next(encoder_model.parameters()).device
-
-    for batch_data in tqdm(test_loader, desc="Computing reconstruction losses"):
-        obs_data = batch_data[0]
-        batch_size = obs_data.shape[0]
-        n_samples += batch_size
-
-        with torch.no_grad():
-            # Encode and decode
-            encoded = encoder_model.encode(obs_data.to(device))
-            decoded = encoder_model.decode(encoded)
-
-            # Calculate MSE loss
-            mse_loss = torch.mean((decoded.cpu() - obs_data) ** 2, dim=(1, 2, 3))
-            mse_losses.extend(mse_loss.tolist())
-
-            total_recon_loss += torch.sum(mse_loss).item()
-
-    avg_recon_loss = total_recon_loss / n_samples
-    mse_std = np.std(mse_losses)
-
-    print(f'📊 Reconstruction Statistics:')
-    print(f'   Average MSE Loss: {avg_recon_loss:.6f}')
-    print(f'   MSE Std Dev: {mse_std:.6f}')
-    print(f'   Min MSE: {min(mse_losses):.6f}')
-    print(f'   Max MSE: {max(mse_losses):.6f}')
-    print(f'   Samples evaluated: {n_samples:,}')
-
-    # Log metrics
-    log_metrics({
-        'encoder_avg_mse_loss': avg_recon_loss,
-        'encoder_mse_std': mse_std,
-        'encoder_min_mse': min(mse_losses),
-        'encoder_max_mse': max(mse_losses),
-        'encoder_samples_evaluated': n_samples
-    }, args)
-
-    return avg_recon_loss, mse_losses
-
-
-def analyze_latent_space(encoder_model, test_loader, encoder_type, args):
-    """Analyze the learned latent space"""
-    print('\n🎯 ANALYZING LATENT SPACE')
-    print('=' * 50)
-
-    device = next(encoder_model.parameters()).device
-    all_latents = []
-
-    # Collect latent representations
-    print('Collecting latent representations...')
-    for batch_data in tqdm(test_loader, desc="Encoding observations"):
-        obs_data = batch_data[0]
-        with torch.no_grad():
-            latents = encoder_model.encode(obs_data.to(device))
-            all_latents.append(latents.cpu())
-
-    all_latents = torch.cat(all_latents, dim=0)
-
-    print(f'📊 Latent Space Statistics:')
-    print(f'   Latent shape: {all_latents.shape}')
-    print(f'   Latent range: [{all_latents.min():.4f}, {all_latents.max():.4f}]')
-    print(f'   Latent mean: {all_latents.mean():.4f}')
-    print(f'   Latent std: {all_latents.std():.4f}')
-
-    # Type-specific analysis
-    if encoder_type == 'discrete':
-        print(f'   Unique values: {torch.unique(all_latents).numel()}')
-        if hasattr(encoder_model, 'n_embeddings'):
-            print(f'   Codebook size: {encoder_model.n_embeddings}')
-            print(f'   Codebook utilization: {torch.unique(all_latents).numel() / encoder_model.n_embeddings:.2%}')
-
-    elif encoder_type == 'continuous':
-        if len(all_latents.shape) > 2:
-            all_latents = all_latents.reshape(all_latents.shape[0], -1)
-
-        print(f'   Latent dimensions: {all_latents.shape[1]}')
-
-        # Per-dimension statistics
-        dim_means = all_latents.mean(dim=0)
-        dim_stds = all_latents.std(dim=0)
-
-        print(f'   Dimension mean range: [{dim_means.min():.4f}, {dim_means.max():.4f}]')
-        print(f'   Dimension std range: [{dim_stds.min():.4f}, {dim_stds.max():.4f}]')
-
-        # Check for dead dimensions (very low variance)
-        dead_dims = (dim_stds < 0.01).sum().item()
-        if dead_dims > 0:
-            print(f'   ⚠️  Dead dimensions (std < 0.01): {dead_dims}')
-
-    # Log metrics
-    log_metrics({
-        'latent_min': all_latents.min().item(),
-        'latent_max': all_latents.max().item(),
-        'latent_mean': all_latents.mean().item(),
-        'latent_std': all_latents.std().item(),
-        'latent_unique_values': torch.unique(all_latents).numel()
-    }, args)
-
-    return all_latents
-
-
-def sample_from_latent_space(encoder_model, all_latents, encoder_type, args, rev_transform):
-    """Sample from the latent space and generate images"""
-    print('\n🎲 SAMPLING FROM LATENT SPACE')
-    print('=' * 50)
-
-    device = next(encoder_model.parameters()).device
-
-    if encoder_type == 'continuous':
-        print('Sampling from continuous latent space...')
-
-        # Reshape latents if needed
-        if hasattr(encoder_model, 'latent_dim'):
-            latent_dim = encoder_model.latent_dim
-            all_latents = all_latents.reshape(all_latents.shape[0], latent_dim)
-        else:
-            latent_dim = all_latents.shape[1] if len(all_latents.shape) == 2 else np.prod(all_latents.shape[1:])
-            all_latents = all_latents.reshape(all_latents.shape[0], latent_dim)
-
-        # Uniform sampling
-        latent_min = all_latents.min()
-        latent_max = all_latents.max()
-        latent_range = latent_max - latent_min
-        uniform_sampled_latents = torch.rand((N_RAND_LATENT_SAMPLES, latent_dim))
-        uniform_sampled_latents = uniform_sampled_latents * latent_range + latent_min
-
-        with torch.no_grad():
-            uniform_obs = encoder_model.decode(uniform_sampled_latents.to(device))
-
-        uniform_imgs = obs_to_img(uniform_obs[:N_EXAMPLE_IMGS].cpu(), env_name=args.env_name,
-                                  rev_transform=rev_transform)
-        log_images({'uniform_continuous_samples': uniform_imgs}, args)
-        print(f'   ✅ Generated {N_EXAMPLE_IMGS} uniform samples')
-
-        # Normal sampling (using empirical mean and std)
-        latent_means = all_latents.mean(dim=0)
-        latent_stds = all_latents.std(dim=0)
-        normal_sampled_latents = torch.normal(
-            latent_means.repeat(N_RAND_LATENT_SAMPLES, 1),
-            latent_stds.repeat(N_RAND_LATENT_SAMPLES, 1))
-
-        with torch.no_grad():
-            normal_obs = encoder_model.decode(normal_sampled_latents.to(device))
-
-        normal_imgs = obs_to_img(normal_obs[:N_EXAMPLE_IMGS].cpu(), env_name=args.env_name, rev_transform=rev_transform)
-        log_images({'normal_continuous_samples': normal_imgs}, args)
-        print(f'   ✅ Generated {N_EXAMPLE_IMGS} normal samples')
-
-    elif encoder_type == 'discrete':
-        print('Sampling from discrete latent space...')
-
-        if hasattr(encoder_model, 'n_latent_embeds') and hasattr(encoder_model, 'n_embeddings'):
-            latent_dim = encoder_model.n_latent_embeds
-            n_embeddings = encoder_model.n_embeddings
-
-            # Uniform discrete sampling
-            sampled_latents = torch.randint(
-                0, n_embeddings, (N_RAND_LATENT_SAMPLES, latent_dim))
-
-            with torch.no_grad():
-                sampled_obs = encoder_model.decode(sampled_latents.to(device))
-
-            sampled_imgs = obs_to_img(sampled_obs[:N_EXAMPLE_IMGS].cpu(), env_name=args.env_name,
-                                      rev_transform=rev_transform)
-            log_images({'uniform_discrete_samples': sampled_imgs}, args)
-            print(f'   ✅ Generated {N_EXAMPLE_IMGS} discrete samples')
-        else:
-            print('   ⚠️  Cannot sample from this discrete encoder type')
-
-
-def generate_reconstruction_examples(encoder_model, test_sampler, args, rev_transform):
-    """Generate reconstruction example images"""
-    print('\n🖼️  GENERATING RECONSTRUCTION EXAMPLES')
-    print('=' * 50)
-
-    device = next(encoder_model.parameters()).device
-    example_imgs = []
-
-    for i, sample_transition in enumerate(test_sampler):
-        if i >= N_EXAMPLE_IMGS:
-            break
-
-        sample_obs = sample_transition[0]
-
-        with torch.no_grad():
-            # Get reconstruction
-            recon_result = encoder_model(sample_obs.to(device))
-
-            # Handle different return formats
-            if isinstance(recon_result, tuple):
-                recon_obs = recon_result[0]  # Take the reconstructed observation
-            else:
-                recon_obs = recon_result
-
-        # Create side-by-side comparison
-        both_obs = torch.cat([sample_obs, recon_obs.cpu()], dim=0)
-        both_imgs = obs_to_img(both_obs, env_name=args.env_name, rev_transform=rev_transform)
-
-        # Concatenate original and reconstruction horizontally
-        if len(both_imgs.shape) == 4:  # Multiple images
-            cat_img = np.concatenate([both_imgs[0], both_imgs[1]], axis=1)
-        else:  # Single comparison
-            cat_img = both_imgs
-
-        example_imgs.append(cat_img)
-
-    # Create a grid of all examples
-    if example_imgs:
-        grid_img = np.concatenate(example_imgs, axis=1)
-
-        plt.figure(figsize=(N_EXAMPLE_IMGS * 2, 4))
-        plt.imshow(grid_img.clip(0, 1))
-        plt.title('Reconstruction Examples (Original | Reconstructed)')
-        plt.axis('off')
-
-        log_images({'reconstruction_examples': example_imgs}, args)
-        print(f'   ✅ Generated {len(example_imgs)} reconstruction examples')
-
-    return example_imgs
-
-
-def analyze_reconstruction_quality(encoder_model, test_sampler, args):
-    """Analyze reconstruction quality with detailed metrics"""
-    print('\n📈 ANALYZING RECONSTRUCTION QUALITY')
-    print('=' * 50)
-
-    device = next(encoder_model.parameters()).device
-
-    # Collect detailed metrics
-    pixel_errors = []
-    ssim_scores = []
-    reconstruction_times = []
-
-    n_analyzed = 0
-    max_analyze = 1000  # Limit for detailed analysis
-
-    for i, sample_transition in enumerate(test_sampler):
-        if i >= max_analyze:
-            break
-
-        sample_obs = sample_transition[0]
-        n_analyzed += 1
-
-        # Time the reconstruction
-        start_time = time.time()
-        with torch.no_grad():
-            recon_result = encoder_model(sample_obs.to(device))
-            if isinstance(recon_result, tuple):
-                recon_obs = recon_result[0]
-            else:
-                recon_obs = recon_result
-        end_time = time.time()
-
-        reconstruction_times.append(end_time - start_time)
-
-        # Calculate pixel-wise error
-        pixel_error = torch.mean(torch.abs(sample_obs - recon_obs.cpu())).item()
-        pixel_errors.append(pixel_error)
-
-    # Compute statistics
-    avg_pixel_error = np.mean(pixel_errors)
-    avg_recon_time = np.mean(reconstruction_times)
-
-    print(f'📊 Quality Metrics (n={n_analyzed}):')
-    print(f'   Average pixel error (L1): {avg_pixel_error:.6f}')
-    print(f'   Pixel error std: {np.std(pixel_errors):.6f}')
-    print(f'   Average reconstruction time: {avg_recon_time:.4f}s')
-    print(f'   Reconstruction throughput: {1 / avg_recon_time:.1f} samples/sec')
-
-    # Log metrics
-    log_metrics({
-        'avg_pixel_error_l1': avg_pixel_error,
-        'pixel_error_std': np.std(pixel_errors),
-        'avg_reconstruction_time': avg_recon_time,
-        'reconstruction_throughput': 1 / avg_recon_time
-    }, args)
-
-    return avg_pixel_error, reconstruction_times
-
-
-def main():
-    """Main evaluation function"""
-    print("🔍 ENCODER MODEL EVALUATION")
-    print("=" * 60)
-
-    # Parse arguments
-    args = get_args()
-
-    # Setup logging
-    args = init_experiment('discrete-mbrl-encoder-eval', args)
-
-    # Set random seed for reproducibility
-    torch.manual_seed(SEED)
+def test_environment_step_by_step(env_name):
+    """Test each component that might cause hanging"""
+    print(f"🧪 Testing environment: {env_name}")
 
     try:
-        # Setup evaluation environment
-        test_loader, test_sampler, rev_transform = setup_evaluation_environment(args)
+        # Step 1: Test basic environment creation
+        print("📍 Step 1: Testing basic environment creation...")
+        from env_helpers import make_env
+        env = make_env(env_name)
+        print(f"✅ Environment created successfully")
+        print(f"   Observation space: {env.observation_space}")
+        print(f"   Action space: {env.action_space}")
 
-        # Load and setup encoder
-        encoder_model, trainer, encoder_type = load_and_setup_encoder(args, test_sampler)
+        # Step 2: Test environment reset
+        print("📍 Step 2: Testing environment reset...")
+        obs = env.reset()
+        if isinstance(obs, tuple):
+            obs, info = obs
+        print(f"✅ Environment reset successful")
+        print(f"   Observation shape: {obs.shape}")
+        print(f"   Observation dtype: {obs.dtype}")
+        print(f"   Observation range: [{obs.min():.3f}, {obs.max():.3f}]")
 
-        # Track model for logging
-        track_model(encoder_model, args)
+        # Step 3: Test environment step
+        print("📍 Step 3: Testing environment step...")
+        action = env.action_space.sample()
+        step_result = env.step(action)
+        print(f"✅ Environment step successful")
+        print(f"   Step result length: {len(step_result)}")
 
-        print(f'\n🎯 Evaluating {encoder_type} encoder: {args.ae_model_type}')
-        print(f'Environment: {args.env_name}')
-        print(f'Device: {args.device}')
+        # Step 4: Test multiple steps
+        print("📍 Step 4: Testing multiple environment steps...")
+        for i in range(10):
+            action = env.action_space.sample()
+            step_result = env.step(action)
+            if len(step_result) == 4:
+                obs, reward, done, info = step_result
+            else:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
 
-        # Evaluate reconstruction performance
-        avg_recon_loss, mse_losses = evaluate_reconstruction_performance(
-            encoder_model, test_loader, args)
+            if done:
+                obs = env.reset()
+                if isinstance(obs, tuple):
+                    obs, info = obs
+                print(f"   Episode ended at step {i}, reset successful")
+                break
+        print(f"✅ Multiple environment steps successful")
 
-        # Analyze latent space
-        all_latents = analyze_latent_space(
-            encoder_model, test_loader, encoder_type, args)
+        env.close()
 
-        # Sample from latent space
-        sample_from_latent_space(
-            encoder_model, all_latents, encoder_type, args, rev_transform)
+    except Exception as e:
+        print(f"❌ Environment test failed at current step: {e}")
+        traceback.print_exc()
+        return False
 
-        # Generate reconstruction examples
-        example_imgs = generate_reconstruction_examples(
-            encoder_model, test_sampler, args, rev_transform)
+    return True
 
-        # Analyze reconstruction quality
-        avg_pixel_error, recon_times = analyze_reconstruction_quality(
-            encoder_model, test_sampler, args)
 
-        # Final summary
-        print('\n' + '=' * 60)
-        print('📋 EVALUATION SUMMARY')
-        print('=' * 60)
-        print(f'🎯 Model: {args.ae_model_type} ({encoder_type})')
-        print(f'📊 Reconstruction MSE: {avg_recon_loss:.6f}')
-        print(f'📊 Pixel Error (L1): {avg_pixel_error:.6f}')
-        print(f'⚡ Throughput: {1 / np.mean(recon_times):.1f} samples/sec')
-        print(f'🎨 Generated {len(example_imgs)} visualization examples')
-        print(f'✅ Evaluation completed successfully!')
+def test_data_loading(env_name):
+    """Test data loading components"""
+    print(f"📍 Testing data loading for: {env_name}")
 
-        # Log final summary
-        log_metrics({
-            'evaluation_summary': {
-                'model_type': args.ae_model_type,
-                'encoder_type': encoder_type,
-                'final_mse': avg_recon_loss,
-                'final_l1': avg_pixel_error,
-                'throughput': 1 / np.mean(recon_times)
-            }
-        }, args)
+    try:
+        # Check if replay buffer exists
+        sanitized_env_name = env_name.replace(':', '_')
+        replay_buffer_path = f'./data/{sanitized_env_name}_replay_buffer.hdf5'
+
+        if not os.path.exists(replay_buffer_path):
+            print(f"❌ Replay buffer not found: {replay_buffer_path}")
+            print("   This is likely the cause of hanging!")
+            return False
+
+        print(f"✅ Replay buffer found: {replay_buffer_path}")
+
+        # Test opening the HDF5 file
+        import h5py
+        with h5py.File(replay_buffer_path, 'r') as f:
+            print(f"   Data keys: {list(f.keys())}")
+            if 'obs' in f:
+                print(f"   Obs shape: {f['obs'].shape}")
+                print(f"   Data index: {f.attrs.get('data_idx', 'Not found')}")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Data loading test failed: {e}")
+        traceback.print_exc()
+        return False
+
+
+def collect_data_for_environment(env_name, n_steps=50000):
+    """Collect replay buffer data for the environment"""
+    print(f"🗂️  Collecting data for environment: {env_name}")
+
+    try:
+        # Import data collection script
+        sys.path.append('.')
+        from collect_data import setup_replay_buffer
+        from env_helpers import make_env
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from threading import Lock
+
+        # Create a simple args object
+        class Args:
+            def __init__(self):
+                self.env_name = env_name
+                self.train_steps = n_steps
+                self.chunk_size = 2048
+                self.compression_type = 'lzf'
+                self.extra_info = []
+                self.env_max_steps = None
+                self.algorithm = 'random'
+                self.n_envs = 4  # Use multiple environments for faster collection
+
+        args = Args()
+
+        # Setup replay buffer
+        print("   Setting up replay buffer...")
+        replay_buffer = setup_replay_buffer(args)
+        buffer_lock = Lock()
+
+        # Create vectorized environment for faster data collection
+        print("   Creating environments...")
+        venv = DummyVecEnv([
+            lambda: make_env(env_name, replay_buffer, buffer_lock,
+                             extra_info=args.extra_info, monitor=True,
+                             max_steps=args.env_max_steps)
+            for _ in range(args.n_envs)
+        ])
+
+        # Collect random data
+        print(f"   Collecting {n_steps} random transitions...")
+        from training_helpers import vec_env_random_walk
+        vec_env_random_walk(venv, n_steps, progress=True)
+
+        print("   Closing replay buffer...")
+        replay_buffer.close()
+
+        print(f"✅ Data collection completed for {env_name}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Data collection failed: {e}")
+        traceback.print_exc()
+        return False
+
+
+def debug_training_start(env_name):
+    """Debug the training initialization process"""
+    print(f"🔍 Debugging training initialization for: {env_name}")
+
+    try:
+        # Test data loader creation
+        print("📍 Testing data loader creation...")
+        from data_helpers import prepare_dataloaders
+
+        # Use small batch size and limited data for testing
+        train_loader, test_loader, valid_loader = prepare_dataloaders(
+            env_name,
+            n=1000,  # Limit to 1000 transitions for testing
+            batch_size=32,  # Small batch size
+            n_step=1,  # Single step for simplicity
+            preprocess=False,
+            randomize=True,
+            n_preload=0,  # No multiprocessing to avoid hanging
+            preload_all=False,
+            extra_buffer_keys=[]
+        )
+
+        print(f"✅ Data loaders created successfully")
+        print(f"   Train dataset size: {len(train_loader.dataset)}")
+        print(f"   Test dataset size: {len(test_loader.dataset)}")
+        print(f"   Valid dataset size: {len(valid_loader.dataset)}")
+
+        # Test getting first batch
+        print("📍 Testing first batch loading...")
+        first_batch = next(iter(train_loader))
+        print(f"✅ First batch loaded successfully")
+        print(f"   Batch shape: {first_batch[0].shape}")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Training initialization debug failed: {e}")
+        traceback.print_exc()
+        return False
+
+
+# Main debugging function
+def debug_minigrid_environment(env_name="MiniGrid-MultiRoom-N2-S4-v0"):
+    """Complete debugging workflow"""
+    print("🚀 Starting MiniGrid Environment Debugging")
+    print("=" * 60)
+
+    # Step 1: Test environment
+    if not test_environment_step_by_step(env_name):
+        print("🛑 Environment test failed - fix environment setup first")
+        return False
+
+    # Step 2: Test data loading
+    if not test_data_loading(env_name):
+        print("🔧 Data loading failed - collecting data...")
+        if not collect_data_for_environment(env_name):
+            print("🛑 Data collection failed")
+            return False
+
+    # Step 3: Test training initialization
+    if not debug_training_start(env_name):
+        print("🛑 Training initialization failed")
+        return False
+
+    print("✅ All debugging tests passed!")
+    print("🎉 Environment should work now")
+    return True
+
+
+# 2. Quick fix for missing data - add to your training script
+
+def ensure_data_exists(env_name, min_transitions=50000):
+    """Ensure replay buffer data exists for the environment"""
+    sanitized_env_name = env_name.replace(':', '_')
+    replay_buffer_path = f'./data/{sanitized_env_name}_replay_buffer.hdf5'
+
+    if not os.path.exists(replay_buffer_path):
+        print(f"⚠️  No data found for {env_name}")
+        print(f"🗂️  Collecting {min_transitions} transitions...")
+
+        # Quick data collection
+        os.system(f"""python collect_data.py \
+            --env_name {env_name} \
+            --train_steps {min_transitions} \
+            --algorithm random \
+            --n_envs 8""")
+
+        if os.path.exists(replay_buffer_path):
+            print(f"✅ Data collection completed")
+        else:
+            raise FileNotFoundError(f"Failed to create data for {env_name}")
+
+
+# 3. Robust environment initialization
+
+def robust_make_env(env_name, max_retries=3, **kwargs):
+    """Robustly create environment with retries and error handling"""
+    from env_helpers import make_env
+
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Creating environment {env_name} (attempt {attempt + 1}/{max_retries})")
+            env = make_env(env_name, **kwargs)
+
+            # Test the environment
+            obs = env.reset()
+            if isinstance(obs, tuple):
+                obs, info = obs
+
+            # Test a few steps
+            for _ in range(3):
+                action = env.action_space.sample()
+                step_result = env.step(action)
+                if len(step_result) >= 4:
+                    obs = step_result[0]
+                else:
+                    raise ValueError(f"Unexpected step result: {step_result}")
+
+            print(f"✅ Environment created and tested successfully")
+            return env
+
+        except Exception as e:
+            print(f"❌ Attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise
+
+            # Wait before retry
+            import time
+            time.sleep(1)
+
+
+# 4. Modified training script with debugging
+
+def debug_and_train(env_name="MiniGrid-MultiRoom-N2-S4-v0"):
+    """Training with comprehensive debugging"""
+
+    print(f"🏋️  Starting training for {env_name}")
+
+    # Step 1: Ensure data exists
+    try:
+        ensure_data_exists(env_name)
+    except Exception as e:
+        print(f"❌ Data setup failed: {e}")
+        return False
+
+    # Step 2: Test environment creation
+    try:
+        env = robust_make_env(env_name)
+        env.close()
+    except Exception as e:
+        print(f"❌ Environment creation failed: {e}")
+        return False
+
+    # Step 3: Start training with timeout protection
+    try:
+        # Your existing training code here
+        from full_train_eval import main
+        main()
 
     except KeyboardInterrupt:
-        print('\n❌ Evaluation interrupted by user')
+        print("🛑 Training interrupted by user")
+        return False
     except Exception as e:
-        print(f'\n❌ Evaluation failed: {e}')
-        import traceback
+        print(f"❌ Training failed: {e}")
         traceback.print_exc()
-    finally:
-        # Clean up logging
-        finish_experiment(args)
+        return False
 
-        # Clean up memory
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    return True
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    # Run debugging
+    debug_minigrid_environment("MiniGrid-MultiRoom-N2-S4-v0")

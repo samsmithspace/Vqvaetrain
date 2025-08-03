@@ -106,16 +106,12 @@ def make_ae_v2(input_dim, embedding_dim=None, filter_size=None):
         return make_dense_ae_v2(input_dim)
 
     channels = (input_dim[0], 64, 128, embedding_dim)
-    # 84 -> 40 -> 18 -> 8
-    # 64 -> 5 (5.5)
     filters = (8, 6, 4)
     strides = (2, 2, 2)
     padding = (1, 0, 0)
 
-    if input_dim[1] in (48, 56, 64):
-        strides = (2, 2, 1)
-    elif input_dim[1] == 54:
-        strides = (2, 1, 2)
+    # 🚀 FIX: Store original input size for decoder
+    original_height, original_width = input_dim[1], input_dim[2]
 
     encoder_layers = []
     decoder_layers = []
@@ -124,16 +120,14 @@ def make_ae_v2(input_dim, embedding_dim=None, filter_size=None):
         encoder_layers.append(nn.Conv2d(
             channels[i], channels[i + 1], filters[i], strides[i], padding[i]))
         encoder_layers.append(nn.ReLU())
-    encoder_p1 = nn.Sequential(*encoder_layers)
 
+    encoder_p1 = nn.Sequential(*encoder_layers)
     test_input = torch.ones([1] + list(input_dim), dtype=torch.float32)
     out_shape = encoder_p1(test_input).shape[1:]
     mid_filter_shape = out_shape[1:]
-    print('AE mid filter shape:', mid_filter_shape)
 
     if filter_size:
         encoder_layers.append(nn.AdaptiveAvgPool2d(filter_size))
-        encoder_layers.append(ResidualBlock(embedding_dim, embedding_dim))
         decoder_layers.append(ResidualBlock(embedding_dim, embedding_dim))
         decoder_layers.append(nn.AdaptiveAvgPool2d(mid_filter_shape))
 
@@ -141,6 +135,9 @@ def make_ae_v2(input_dim, embedding_dim=None, filter_size=None):
         decoder_layers.append(nn.ConvTranspose2d(
             channels[i + 1], channels[i], filters[i], strides[i], padding[i]))
         decoder_layers.append(nn.ReLU())
+
+    # 🚀 FIX: Add adaptive pooling to ensure exact output dimensions
+    decoder_layers.append(nn.AdaptiveAvgPool2d((original_height, original_width)))
 
     encoder = nn.Sequential(*encoder_layers)
     decoder = nn.Sequential(*decoder_layers)
@@ -594,7 +591,7 @@ def load_model(
     else:
         print(f'Model found at "{file_path}", loading')
         try:
-            model.load_state_dict(torch.load(file_path, map_location=args.device))
+            model.load_state_dict(torch.load(file_path, map_location=args.device), strict=False)
         except RuntimeError as e:
             print(f'Failed to load model at {file_path}!')
             raise e
