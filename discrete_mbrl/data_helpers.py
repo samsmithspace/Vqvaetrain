@@ -122,17 +122,19 @@ class ObsTransforms:
 
 
 class NStepReplayDataset(Dataset):
-    def __init__(self, env_name, transform=None, preload=False,
-                 start_idx=0, end_idx=None, extra_buffer_keys=None):
+    def __init__(self, env_name, n_steps, transform=None, preload=False,
+                 start_idx=0, end_idx=None, extra_buffer_keys=None, cross_chunks=True):
         import time
         start_time = time.time()
-        #print(f'🕐 Initializing ReplayDataset for {env_name}')
+        #print(f'🕐 Initializing NStepReplayDataset for {env_name}')
 
         sanitized_env_name = env_name.replace(':', '_')
         extra_buffer_keys = extra_buffer_keys or []
         self.replay_buffer_path = f'{DATA_DIR}/{sanitized_env_name}_replay_buffer.hdf5'
         self.transform = transform
         self.preload = preload
+        self.n_steps = n_steps
+        self.cross_chunks = cross_chunks
 
         #print(f'🕐 Opening HDF5 file: {self.replay_buffer_path}')
         h5_start = time.time()
@@ -189,7 +191,7 @@ class NStepReplayDataset(Dataset):
             self.length = self.n_samples - self.n_steps + 1
         else:
             # Calculate number of n_step samples that don't cross chunk boundaries
-            n_full_chunks = self.chunk_size // self.n_samples
+            n_full_chunks = self.n_samples // self.chunk_size
             samples_per_chunk = self.chunk_size - self.n_steps + 1
             extra_samples = max(0,
                                 (self.n_samples % self.chunk_size) - self.n_steps + 1)
@@ -243,7 +245,7 @@ class NStepReplayDataset(Dataset):
         return transition_set
 
     def __getitem_no_cross_chunks(self, idx):
-        raise NotImplementedError
+        raise NotImplementedError("No cross chunks mode not implemented yet")
 
     # Add these properties for compatibility
     @property
@@ -261,6 +263,7 @@ class NStepReplayDataset(Dataset):
     @property
     def flat_rev_obs_transform(self):
         return self.obs_transforms.flat_rev_obs_transform
+
 
 
 class ReplayDataset(Dataset):
@@ -594,8 +597,9 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
     dataset_start = time.time()
     transform = preprocess_transform if preprocess else None
     if n_step > 1:
+        # FIXED: Pass n_step as a keyword argument to avoid the "multiple values" error
         dataset = NStepReplayDataset(
-            env_name, n_step, transform=transform, preload=preload_all,
+            env_name, n_steps=n_step, transform=transform, preload=preload_all,
             extra_buffer_keys=extra_buffer_keys)
     else:
         dataset = ReplayDataset(
@@ -621,7 +625,8 @@ def prepare_dataloaders(env_name, batch_size=256, randomize=True, n_step=1,
     #valid_start = time.time()
     if valid_preload and not preload_all:
         if n_step > 1:
-            valid_dataset = NStepReplayDataset(env_name, n_step, transform=transform,
+            # FIXED: Pass n_step as keyword argument here too
+            valid_dataset = NStepReplayDataset(env_name, n_steps=n_step, transform=transform,
                                                preload=True, start_idx=n - n_valid, end_idx=n,
                                                extra_buffer_keys=extra_buffer_keys)
         else:
